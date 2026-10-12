@@ -65,43 +65,9 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 
 **Style:** microservices, stateless where possible, communicating over HTTP (synchronous) and SQS/SNS/EventBridge (asynchronous). The **media data path is kept off the application compute** — clients upload directly to S3 via presigned URLs and play back through CloudFront. Services only handle metadata and orchestration.
 
-```
-                         ┌───────────────┐
-                         │   Flutter app │ (web + android)
-                         └──────┬────────┘
-                                │ HTTPS
-                        ┌───────▼────────┐     ┌──────────────┐
-                        │  API Gateway   │────▶│   Cognito    │ (authN/Z, JWT)
-                        │  / ALB         │     └──────────────┘
-                        └───────┬────────┘
-             ┌──────────────────┼───────────────────┐
-             ▼                  ▼                   ▼
-      ┌────────────┐    ┌──────────────┐    ┌───────────────┐
-      │  Catalog / │    │   Upload /    │    │ Interactions  │
-      │  Metadata  │    │   Ingest svc  │    │ (comments,    │
-      │  svc (Go)  │    │   (Python)    │    │  likes) (Go)  │
-      └─────┬──────┘    └──────┬────────┘    └──────┬────────┘
-            │                  │ presigned URL      │
-            ▼                  ▼                     ▼
-      ┌───────────┐     ┌─────────────┐       ┌───────────┐
-      │ PostgreSQL│     │   S3 (raw)  │       │ PostgreSQL│
-      │ (RDS/     │     └──────┬──────┘       │  + Redis  │
-      │  Aurora)  │            │ S3 event      │ (counters)│
-      └───────────┘            ▼               └───────────┘
-                         ┌───────────┐
-                         │    SQS    │
-                         └─────┬─────┘
-                               ▼
-                      ┌──────────────────┐
-                      │ Transcoder worker│  (Python; MediaConvert
-                      │  → HLS renditions│   or ffmpeg on Fargate)
-                      └────────┬─────────┘
-                               ▼
-                      ┌───────────────┐     ┌──────────────┐
-                      │  S3 (output,  │────▶│  CloudFront  │──▶ viewers
-                      │  HLS/segments)│     │     (CDN)    │
-                      └───────────────┘     └──────────────┘
-```
+![MyCilinder high-availability AWS architecture](docs/diagrams/architecture.png)
+
+*Figure 1 — Target (design-scale) architecture. The deployed demo runs a throttled subset of this topology (see "Design scale vs. demo scale" below).*
 
 **Upload → playback flow**
 1. Client requests a presigned upload URL from the Upload service.
@@ -109,6 +75,62 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 3. S3 `ObjectCreated` event → SQS → Transcoder worker.
 4. Worker produces adaptive-bitrate HLS renditions, writes them to the output bucket, updates metadata status to `READY`.
 5. Viewers stream HLS via CloudFront; the API only serves metadata + signed playback URLs.
+
+### 3.1 Architecture drivers
+
+- **Highly available read/playback path:** every component on it is a managed, multi-AZ service; no single instance or AZ in the request path.
+- **Scalable by design:** stateless containers behind autoscaling, a CDN for media, and a cache plus read replica for metadata.
+- **Media stays off compute:** presigned PUT in, CloudFront out; services only handle metadata and orchestration.
+- **Cost-aware:** transcoding runs on Fargate Spot, scaled by queue depth, with capped renditions and input length.
+- **Secure by default:** JWT validated at the edge, all compute and data in private subnets, private buckets.
+
+### 3.2 Component description
+
+**Edge (global services)**
+- **Route 53** resolves the public domain; **AWS WAF** protects CloudFront and API Gateway with managed and rate-based rules.
+- **CloudFront** is the only playback entry point. It caches HLS manifests and segments, enforces signed URLs, and reads the private output bucket through Origin Access Control (OAC).
+- **API Gateway (HTTP API)** is the single API entry point. It applies throttling, validates the **Cognito** JWT, and forwards traffic to the VPC through a **VPC Link**.
+
+**Network (VPC across two Availability Zones)**
+- Three subnet tiers per AZ: **public** (NAT Gateway), **private-app** (ECS tasks), and **private-data** (Aurora, Redis, no internet route).
+- An **internal ALB** spans both AZs and routes by path prefix to the ECS services; it is reachable only through the VPC Link.
+- **VPC endpoints** (S3, SQS, ECR, CloudWatch Logs) keep AWS traffic private and reduce NAT cost.
+
+**Compute (ECS Fargate, tasks spread across both AZs)**
+
+| Service | Lang | Responsibility | Scaling signal |
+|---------|------|----------------|----------------|
+| Auth facade | Go | Register/login/refresh over Cognito; stable `/auth` contract for the client | CPU / requests |
+| Catalog / Metadata API | Go | Videos, feed, search, video detail; consumes `READY` status events | CPU / requests |
+| Interactions API | Go | Comments, likes, views; counters kept in Redis and flushed asynchronously to Aurora | CPU / requests |
+| Upload / Ingest API | Python | Validates quotas, creates the video record, returns the presigned S3 PUT URL | CPU / requests |
+| Transcoder worker | Python + ffmpeg | Consumes the transcode queue, produces 360p/720p HLS, publishes a `video-events` message | Queue depth (Spot) |
+
+**Data, storage, and messaging**
+- **S3 `raw-videos`** (versioned, private) receives uploads via presigned URLs; **S3 `hls-output`** (private) is readable only through CloudFront.
+- **Aurora PostgreSQL** has a writer in AZ-a and a reader replica in AZ-b with automatic failover. **ElastiCache Redis** has a primary and replica in separate AZs and holds the hot feed cache and counters.
+- S3 `ObjectCreated` feeds the **SQS `transcode-queue`** (with a dead-letter queue). On completion the worker publishes to the **SNS `video-events`** topic; a subscribed SQS queue lets Catalog mark the video `READY` or `FAILED`.
+
+**Operations:** CloudWatch (logs, metrics, alarms) and X-Ray (traces) receive data from every service; ECR stores images, Secrets Manager holds credentials, and AWS Budgets raises billing alarms.
+
+### 3.3 High-availability strategy
+
+The key decision is that **playback does not depend on the VPC, the containers, or the database**: once a client has a signed URL, delivery is CloudFront → S3 only. An application-tier failure degrades browsing and interactions but not videos already playing.
+
+| Failure scenario | Behavior |
+|------------------|----------|
+| Single Fargate task fails | The ALB health check removes it and ECS replaces it; other tasks keep serving. |
+| Entire AZ unavailable | Traffic shifts to tasks in the other AZ; Aurora promotes its replica and Redis fails over. Clients retry with backoff during failover. |
+| Redis unavailable | Catalog falls back to Aurora (slower, still correct); Interactions buffers counter updates briefly. |
+| Transcoder crash or Spot interruption | The SQS message becomes visible again and is retried; repeated failures go to the DLQ and raise an alarm. Raw objects are retained, so any video can be re-queued. |
+| Upload spike | SQS absorbs the burst and the worker fleet scales on queue depth, up to a maximum that protects the budget. Playback is unaffected. |
+
+Durability: S3 provides 11-nines durability with versioning on the raw bucket, and Aurora has continuous backups with point-in-time recovery. The design is **single-region**; multi-region is listed under Future work (§7).
+
+### 3.4 Scalability and security
+
+- **Scalability:** services are stateless and scale horizontally behind the ALB; CloudFront, Redis, and Aurora readers absorb read load; like/view counters are batched into Aurora to avoid write hotspots; transcoding scales out and back to zero on queue depth. Known limits at 1M DAU: search should move to OpenSearch and comment writes may need sharding (§7).
+- **Security:** the only public surfaces are CloudFront and API Gateway, both behind WAF. Each ECS service has its own least-privilege task role, data is encrypted at rest and in transit, and secrets live in Secrets Manager.
 
 ---
 
