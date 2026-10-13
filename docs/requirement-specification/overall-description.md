@@ -3,15 +3,13 @@
 Part of the MyCilinder Software Requirements Specification (SRS).
 Related: [Functional Requirements](./functional-requirements.md) · [Non-Functional Requirements](./non-functional-requirements.md) · [Project charter](../../README.md)
 
-> **Convention:** items tagged **`[TBC]`** are assumptions made by the author of this draft that the team must confirm or correct before the Requirements gate sign-off. They are consolidated in §6.
-
 ---
 
 ## 1. Product Functions
 
 MyCilinder is a video-on-demand (VOD) platform. Users upload videos, the system transcodes them asynchronously into adaptive-bitrate HLS, and any viewer can browse, search, watch, and interact with them. Live streaming is out of scope.
 
-**Product perspective.** The product is a set of backend microservices (this repo) consumed by a Flutter client (Android + web, separate repo) over a REST API defined in `docs/openapi.yaml`. Infrastructure is provisioned by a separate Terraform repo. Media bytes never pass through the API: uploads go directly to S3 via presigned URLs and playback is served by CloudFront.
+**Product perspective.** The product is a set of backend microservices (this repo) consumed by a Flutter client (Android + web, separate repo) over an API defined in `docs/openapi.yaml`. Infrastructure is provisioned by a separate Terraform repo. Media bytes never pass through the API: uploads go directly to S3 via presigned URLs and playback is served by CloudFront.
 
 | # | Function | Summary | Detailed in |
 |---|----------|---------|-------------|
@@ -30,9 +28,9 @@ MyCilinder is a video-on-demand (VOD) platform. Users upload videos, the system 
 
 | Class | Description | Technical skill | Permissions | Priority |
 |-------|-------------|-----------------|-------------|----------|
-| **Guest** | Unauthenticated visitor, typically arriving via a shared link. | None assumed. | Browse, search, watch, read comments and counts. Cannot upload, comment, or like. `[TBC]` | High |
+| **Guest** | Unauthenticated visitor, typically arriving via a shared link. | None assumed. | Browse, search, watch, read comments and counts. Cannot upload, comment, or like. | High |
 | **Registered User** | Authenticated account holder. Primary consumer of the platform. | Low to moderate; familiar with mainstream video apps. | Everything a Guest can do, plus comment, like, report, and manage own profile. | High |
-| **Creator** | A Registered User who uploads videos. Not a separate account type; the capability is available to every verified user. `[TBC]` | Low to moderate. Expects upload progress and clear processing status. | Registered User permissions, plus upload, edit, and delete **own** videos and delete comments on own videos. | High |
+| **Creator** | A Registered User who uploads videos. Not a separate account type; the capability is available to every verified user. | Low to moderate. Expects upload progress and clear processing status. | Registered User permissions, plus upload, edit, and delete **own** videos and delete comments on own videos. | High |
 | **Platform Operator** | A member of the development team operating the system (AWS console, dashboards, scripts). | High. | Review reports, hide content, view metrics and logs. There is **no admin UI in the MVP**; operator actions are performed through restricted endpoints or operational scripts. `[TBC]` | Medium |
 
 Non-human actors that appear in use cases: the **Transcoder worker** (consumes queue jobs) and **Cognito** (identity provider).
@@ -42,13 +40,13 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 ## 3. Operating Environment
 
 **Clients**
-- **Android:** Flutter app, sideloaded as an APK for the demo. Minimum Android version is defined by the Frontend repo (Flutter default floor). `[TBC]`
+- **Android:** Flutter app, sideloaded as an APK for the demo. Minimum Android version is defined by the Frontend repo (Flutter default floor).
 - **Web:** Latest two versions of Chrome, Edge, Firefox, and Safari. Hosted on Vercel (free tier) only if a web demo is needed.
 - **HLS note:** Safari plays HLS natively. Other browsers need an MSE-based HLS player (e.g. hls.js-style). Flutter-web HLS playback must be validated early in Design (see R5, walking skeleton).
 - **Network:** HTTPS only. Clients must tolerate mobile-grade bandwidth; adaptive bitrate handles variation.
 
 **Server side**
-- **Cloud:** AWS, single region. The region is chosen in Design (service availability, price, and latency to the user base). `[TBC]`
+- **Cloud:** AWS, single region. The region is chosen in Design (service availability, price, and latency to the user base).
 - **Compute:** Linux containers on ECS Fargate, built per service and stored in ECR.
 - **Runtimes:** Go (Catalog, Interactions, Auth facade) and Python (Upload/Ingest, Transcoder worker). See README §6.
 - **Data:** RDS PostgreSQL, ElastiCache Redis, S3 (`raw` and `output` buckets), SQS, CloudFront, Cognito.
@@ -56,7 +54,8 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 
 **Environments** `[TBC]`
 - **Local:** Docker Compose for developing individual services.
-- **AWS demo:** a single environment, sized for demo scale (see the Back-of-envelope section in the NFR document). A separate staging environment is not planned, because credits do not allow it.
+- **AWS development:** AWS environment for development.
+- **AWS demo:** an environment sized for demo scale (see the Back-of-envelope section in the NFR document).
 
 ---
 
@@ -75,8 +74,7 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 | C-09 | MVP transcodes to **360p and 720p only**, with caps on input size, duration, and resolution. | Cost control (R1, R2) |
 | C-10 | Web frontend, if hosted, uses **Vercel free tier**; otherwise Android APK is sideloaded. | Team decision |
 | C-11 | No public write access to buckets; media is served only through signed URLs. | Security (R7) |
-| C-12 | Team of 3 part-time students; each service needs a primary and a backup owner. | Resourcing (R8) |
-| C-13 | **Regulatory:** no formal compliance program (e.g. Mexican personal-data law LFPDPPP, copyright takedown) is in scope. The system limits risk by collecting minimal personal data and providing reporting hooks. Legal review is out of scope. `[TBC]` | Scope decision |
+| C-12 | **Regulatory:** no formal compliance program (e.g. Mexican personal-data law LFPDPPP, copyright takedown) is in scope. The system limits risk by collecting minimal personal data and providing reporting hooks. Legal review is out of scope.  | Scope decision |
 
 ---
 
@@ -86,15 +84,15 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 
 | ID | Assumption |
 |----|------------|
-| A-01 | Credits come from a **standard AWS account** where the team can create IAM roles, Cognito pools, CloudFront distributions, etc. If the account is a restricted lab environment (for example AWS Academy Learner Lab), parts of the design and the Terraform approach will change. `[TBC]` |
+| A-01 | Credits come from a **standard AWS account** where the team can create IAM roles, Cognito pools, CloudFront distributions, etc. |
 | A-02 | Credits are enough for a short-lived demo at the **demo scale** defined in the NFR document, not for sustained load. |
 | A-03 | Demo traffic is small and curated: tens of users, a small catalog of short videos. |
 | A-04 | The 100k–1M DAU figures are a **design target**, validated by calculation (back-of-envelope) and architecture review, not by production traffic. |
-| A-05 | Every registered user may upload (no creator approval). `[TBC]` |
-| A-06 | Guests may watch public videos without logging in. `[TBC]` |
-| A-07 | All published videos are public. Private and unlisted visibility are out of scope. `[TBC]` |
-| A-08 | Comments are flat (no replies, no comment likes) in the MVP. `[TBC]` |
-| A-09 | Users are expected to be 13 or older. Age verification is not implemented. `[TBC]` |
+| A-05 | Every registered user may upload (no creator approval). |
+| A-06 | Guests may watch public videos without logging in. |
+| A-07 | All published videos are public. Private and unlisted visibility are out of scope. |
+| A-08 | Comments are flat (no replies, no comment likes) in the MVP. |
+| A-09 | Users are expected to be 13 or older. Age verification is not implemented. |
 | A-10 | Counters (views, likes) may be **eventually consistent** by a few seconds. |
 
 ### 5.2 Dependencies
@@ -120,18 +118,3 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 
 **Platform constraints to watch**
 - New or educational AWS accounts often have **low default service quotas** (e.g. Fargate vCPU, concurrent tasks). These can block scale-up demonstrations. Check quotas in Design.
-
----
-
-## 6. Open Items to Confirm (`[TBC]` summary)
-
-1. **AWS account type** (A-01): standard account or restricted lab? This is the highest-impact open item.
-2. **Guest access** (A-06): may guests watch, or must everyone log in?
-3. **Upload permissions** (A-05): can any verified user upload?
-4. **Visibility** (A-07): public only, or also unlisted/private?
-5. **Comments** (A-08): flat only?
-6. **Operator tooling** (§2): is script/endpoint-based moderation acceptable, with no admin UI?
-7. **Upload limits** (see Business Rules BR-LIM in the functional document): 10 min, 1 GB, 1080p, 5 uploads per day.
-8. **AWS region and environments** (§3).
-9. **Android minimum version** (§3).
-10. **Legal posture** (C-13, A-09).

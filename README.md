@@ -67,7 +67,7 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 
 ![MyCilinder high-availability AWS architecture](docs/diagrams/architecture.png)
 
-*Figure 1 — Target (design-scale) architecture. The deployed demo runs a throttled subset of this topology (see "Design scale vs. demo scale" below).*
+*Figure 1 — Target (design-scale) architecture. The deployed demo runs a throttled subset of this topology.*
 
 **Upload → playback flow**
 1. Client requests a presigned upload URL from the Upload service.

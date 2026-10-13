@@ -6,7 +6,6 @@ Related: [Overall Description](./overall-description.md) · [Non-Functional Requ
 **Conventions**
 - Requirement IDs are `FR-<AREA>-<NN>`. "The system shall" is implied in every requirement row.
 - **Priority** uses MoSCoW: **M**ust · **S**hould · **C**ould · **W**on't (MVP).
-- Items tagged **`[TBC]`** are draft assumptions awaiting team confirmation (see Overall Description §6).
 - "Services" refers to the backend microservices: Auth facade, Catalog, Interactions (Go) and Upload/Ingest, Transcoder (Python).
 
 ---
@@ -51,7 +50,7 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 | FR-AUTH-06 | A user can log out, which revokes the refresh token. | S |
 | FR-AUTH-07 | A user can reset a forgotten password with an emailed code. | S |
 | FR-AUTH-08 | A user can view their profile and change their display name. | S |
-| FR-AUTH-09 | Account deletion and profile pictures are not supported in the MVP. | W |
+| FR-AUTH-09 | A user can delere their profile and change their profile picture. `[TBD]`| W |
 
 ---
 
@@ -68,7 +67,7 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-UP-01 | An authenticated user can start an upload by submitting title, description, file name, content type, and size. | M |
+| FR-UP-01 | An authenticated user can start an upload by submitting title, description, content type, and size. | M |
 | FR-UP-02 | Before issuing a URL, the system validates declared format, size, and the user's daily quota, and rejects violations with a clear error. | M |
 | FR-UP-03 | The system creates a video record in `PENDING_UPLOAD` and returns the `videoId` and a presigned URL that expires in a short time (BR-LIM). | M |
 | FR-UP-04 | The file is uploaded directly from the client to the `raw` bucket. | M |
@@ -220,7 +219,7 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
   4. Cognito emails a verification code.
   5. The guest enters the code and the facade confirms it.
 - **Alternate flows:**
-  - 3a. Email already registered: the system responds with a generic error that does not reveal whether the account exists. `[TBC]`
+  - 3a. Email already registered: the system responds with a generic error that does not reveal whether the account exists.
   - 3b. Password violates policy: the system returns which rule failed.
   - 5a. Code expired or wrong: the guest can request a new code.
 - **Postcondition:** A confirmed account exists. The local profile is created on first login (FR-AUTH-05).
@@ -320,11 +319,11 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
 
 | ID | Rule |
 |----|------|
-| BR-01 | Only authenticated, verified users can upload, comment, like, or report. Guests have read-only access. `[TBC]` |
+| BR-01 | Only authenticated, verified users can upload, comment, like, or report. Guests have read-only access. |
 | BR-02 | A user can modify or delete only their own resources (videos, comments). Video owners may also delete comments on their videos. Operators are the only role that can hide a video. |
 | BR-03 | A video appears in the catalog, search, and playback for non-owners only when its status is `READY`. |
 | BR-04 | A user can like a given video at most once. |
-| BR-05 | The pipeline never deletes or overwrites raw uploads. User deletion removes the video from the product (soft delete); physical retention of the raw object is a retention decision to be confirmed. `[TBC]` |
+| BR-05 | The pipeline never deletes or overwrites raw uploads. User deletion removes the video from the product (soft delete). |
 | BR-06 | All media is delivered through signed URLs. Buckets are never public. |
 | BR-07 | Like, view, and comment counters are eventually consistent, and a periodic reconciliation job corrects drift against source-of-truth rows. |
 | BR-08 | Requests are rate-limited per user and per IP (values in the NFR document). |
@@ -332,11 +331,11 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
 
 ### 3.2 View counting rule (BR-VIEW)
 
-A view is counted when playback starts. Repeat views by the same viewer (user id, or an anonymous session id for guests) on the same video within a **30-minute window** are not counted again. `[TBC]`
+A view is counted when playback starts. Repeat views by the same viewer (user id, or an anonymous session id for guests) on the same video within a **30-minute window** are not counted again.
 
 ### 3.3 Limits and configurable parameters (BR-LIM)
 
-These are configuration values, not hard-coded. The demo environment may set stricter values to protect credits. All values are `[TBC]`.
+These are configuration values, not hard-coded. The demo environment may set stricter values to protect credits.
 
 | Parameter | MVP value | Reason |
 |-----------|-----------|--------|
