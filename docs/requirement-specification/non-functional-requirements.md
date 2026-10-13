@@ -6,7 +6,6 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 **Conventions**
 - IDs are `<AREA>-<NN>`: `PERF`, `SEC`, `REL`, `SCAL`, `MAINT`. The *Charter* column maps each requirement to the high-level objectives NFR1–NFR7 in the README.
 - Every requirement has two targets where relevant: the **Design target** (what the architecture must be able to reach, 100k–1M DAU) and the **Demo target** (what we deploy and test within the AWS credit budget). The gap between the two is intentional (README §1, R1).
-- Items tagged **`[TBC]`** are draft assumptions awaiting team confirmation.
 - Numbers in §5 are estimates built on stated assumptions. They are for sizing and reasoning, not measured results.
 
 ---
@@ -19,11 +18,11 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | PERF-02 | API write endpoints (comment, like, upload request) | p95 < 500 ms | p95 < 500 ms | NFR3 |
 | PERF-03 | Search endpoint | p95 < 500 ms | p95 < 500 ms | NFR3 |
 | PERF-04 | Playback start on a CDN cache hit (first frame) | < 2 s | < 2 s | NFR3 |
-| PERF-05 | CDN cache hit ratio for media segments | ≥ 90% `[TBC]` | not measured | NFR3, NFR5 |
-| PERF-06 | Time from upload complete to `READY` for a 5-minute video, under normal load | p90 ≤ 10 min (queue wait + transcode) `[TBC]` | p90 ≤ 10 min | NFR3 |
-| PERF-07 | Throughput the read path sustains at peak | ≈ 2,100 requests/s at 1M DAU (§5) | ≥ 50 requests/s (sized for ≈ 25 concurrent users) `[TBC]` | NFR1 |
+| PERF-05 | CDN cache hit ratio for media segments | ≥ 90%  | not measured | NFR3, NFR5 |
+| PERF-06 | Time from upload complete to `READY` for a 5-minute video, under normal load | p90 ≤ 10 min (queue wait + transcode) | p90 ≤ 10 min | NFR3 |
+| PERF-07 | Throughput the read path sustains at peak | ≈ 2,100 requests/s at 1M DAU (§5) | ≥ 50 requests/s (sized for ≈ 25 concurrent users) | NFR1 |
 | PERF-08 | Counter writes (views, likes) must not block the request path | Async/buffered via Redis | Same | NFR1 |
-| PERF-09 | Resource footprint: services are right-sized; each Go service runs in ≤ 0.5 vCPU / 1 GB per task `[TBC]` | Validate in load test | Same | NFR5 |
+| PERF-09 | Resource footprint: services are right-sized; each Go service runs in ≤ 0.5 vCPU / 1 GB per task | Validate in load test | Same | NFR5 |
 
 **Notes**
 - Latency targets apply to API processing, excluding the client's network.
@@ -46,7 +45,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | SEC-06 | **Least privilege IAM:** each service has its own task role granting only the actions and resources it needs. No wildcard administrator roles at runtime. | NFR6, R7 |
 | SEC-07 | **Input validation:** all inputs are validated for type, length, and format. SQL access uses parameterized queries only. Comment and description text is stored raw and escaped on output by clients. | NFR6 |
 | SEC-08 | **Untrusted media:** uploaded files are probed with `ffprobe` in an isolated worker (no network access beyond S3/SQS where feasible) before transcoding. File type is determined from content, not from the file name or declared MIME type. | NFR6 |
-| SEC-09 | **Rate limiting and quotas:** per-user and per-IP limits at the API edge (starting values: 100 requests/min per user for reads, 20/min for writes, 5 uploads/day) `[TBC]`. Login endpoints are throttled to resist credential stuffing. | NFR6, R10 |
+| SEC-09 | **Rate limiting and quotas:** per-user and per-IP limits at the API edge (starting values: 100 requests/min per user for reads, 20/min for writes, 1 upload/minute). Login endpoints are throttled to resist credential stuffing. | NFR6, R10 |
 | SEC-10 | **Secrets:** no secrets in source control or container images. They are stored in AWS Secrets Manager or SSM Parameter Store and injected at runtime. | NFR6 |
 | SEC-11 | **Password policy and account protection:** enforced by Cognito (minimum length and complexity, email verification, throttling). No password is ever stored or logged by our services. | NFR6 |
 | SEC-12 | **Privacy:** collect only email and display name. Do not log tokens, passwords, or full email addresses. Logs avoid personal data beyond opaque user IDs. | NFR6, C-13 |
@@ -80,11 +79,11 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | ID | Requirement | Design target | Demo target | Charter |
 |----|-------------|---------------|-------------|---------|
 | REL-01 | **Availability of the read/playback path** (browse, detail, playback URL, CDN) | 99.9% monthly ≈ **43.8 min** downtime per month | Best effort | NFR2 |
-| REL-02 | Availability of write paths (upload, comment, like) | 99.5% `[TBC]` | Best effort | NFR2 |
+| REL-02 | Availability of write paths (upload, comment, like) | 99.5% | Best effort | NFR2 |
 | REL-03 | Upload and transcoding are asynchronous and may be delayed, but accepted uploads must not be lost. | Zero lost accepted uploads | Same | NFR2, NFR4 |
-| REL-04 | **RPO** (maximum data loss) for relational data | ≤ 5 min (RDS point-in-time recovery + Multi-AZ) | ≤ 24 h (daily snapshot) `[TBC]` | NFR2, NFR4 |
+| REL-04 | **RPO** (maximum data loss) for relational data | ≤ 5 min (RDS point-in-time recovery + Multi-AZ) | ≤ 24 h (daily snapshot) | NFR2, NFR4 |
 | REL-05 | **RTO** for loss of one Availability Zone | ≤ 15 min, automatic | Not guaranteed | NFR2 |
-| REL-06 | **RTO** for loss of the whole region | ≤ 4 h by re-provisioning with Terraform and restoring data (documented, not exercised in the MVP) `[TBC]` | Out of scope | NFR2 |
+| REL-06 | **RTO** for loss of the whole region | ≤ 4 h by re-provisioning with Terraform and restoring data (documented, not exercised in the MVP) | Out of scope | NFR2 |
 | REL-07 | Source media durability | S3 durability. Versioning enabled on `raw`. | Same | NFR4, R9 |
 
 ### 3.2 Design requirements
@@ -217,13 +216,13 @@ Transcoding is **bursty and queue-buffered**. Workers can be provisioned below p
 
 ### 5.7 Service sizing (compute)
 
-Assuming one Go API task handles ≈ 500 requests/s `[TBC, to be verified by load test]`:
+Assuming one Go API task handles ≈ 500 requests/s `[to be verified by load test]`:
 - 1M DAU peak 2,100 req/s ÷ 500 ≈ 5 tasks at full utilization.
 - At 50% target utilization for headroom (SCAL-08), and spread across 2 AZs, about **10 API tasks in total** across Catalog, Interactions, and Auth.
 
 ### 5.8 Demo-scale sizing (proposed)
 
-| Item | Demo target `[TBC]` |
+| Item | Demo target |
 |------|---------------------|
 | Concurrent viewers | ≈ 25 |
 | Registered users | ≈ 50 |
