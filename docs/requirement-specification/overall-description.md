@@ -31,7 +31,7 @@ MyCilinder is a video-on-demand (VOD) platform. Users upload videos, the system 
 | **Guest** | Unauthenticated visitor, typically arriving via a shared link. | None assumed. | Browse, search, watch, read comments and counts. Cannot upload, comment, or like. | High |
 | **Registered User** | Authenticated account holder. Primary consumer of the platform. | Low to moderate; familiar with mainstream video apps. | Everything a Guest can do, plus comment, like, report, and manage own profile. | High |
 | **Creator** | A Registered User who uploads videos. Not a separate account type; the capability is available to every verified user. | Low to moderate. Expects upload progress and clear processing status. | Registered User permissions, plus upload, edit, and delete **own** videos and delete comments on own videos. | High |
-| **Platform Operator** | A member of the development team operating the system (AWS console, dashboards, scripts). | High. | Review reports, hide content, view metrics and logs. There is **no admin UI in the MVP**; operator actions are performed through restricted endpoints or operational scripts. `[TBC]` | Medium |
+| **Platform Operator** | A member of the development team operating the system (AWS console, dashboards, scripts). | High. | Review reports, hide content, view metrics and logs. There is **no admin UI in the MVP**; operator actions are performed through restricted endpoints. | Medium |
 
 Non-human actors that appear in use cases: the **Transcoder worker** (consumes queue jobs) and **Cognito** (identity provider).
 
@@ -49,10 +49,10 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 - **Cloud:** AWS, single region. The region is chosen in Design (service availability, price, and latency to the user base).
 - **Compute:** Linux containers on ECS Fargate, built per service and stored in ECR.
 - **Runtimes:** Go (Catalog, Interactions, Auth facade) and Python (Upload/Ingest, Transcoder worker). See README §6.
-- **Data:** RDS PostgreSQL, ElastiCache Redis, S3 (`raw` and `output` buckets), SQS, CloudFront, Cognito.
+- **Data:** Aurora PostgreSQL, ElastiCache Redis, S3 (`raw` and `output` buckets), SQS, CloudFront, Cognito.
 - **Provisioning & delivery:** Terraform (separate repo), GitHub Actions CI/CD.
 
-**Environments** `[TBC]`
+**Environments**
 - **Local:** Docker Compose for developing individual services.
 - **AWS development:** AWS environment for development.
 - **AWS demo:** an environment sized for demo scale (see the Back-of-envelope section in the NFR document).
@@ -106,9 +106,9 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 | Amazon CloudFront | Media delivery | Playback degraded or down. |
 | Amazon SQS | Transcode job queue | New uploads queue up unprocessed. |
 | Amazon ECS Fargate / ECR | Running services | Service outage. |
-| Amazon RDS PostgreSQL | Metadata, comments, likes | Core read path down. |
+| Amazon Aurora PostgreSQL | Metadata, comments, likes | Core read path down. |
 | ElastiCache Redis | Counters and hot cache | Degrades to DB reads (see NFR REL). |
-| AWS MediaConvert **or** ffmpeg on Fargate | Transcoding (decided in Design) | Videos stay in PROCESSING. |
+| Ffmpeg on Fargate | Transcoding (decided in Design) | Videos stay in PROCESSING. |
 | Vercel (optional) | Web client hosting | Web demo unavailable. Android demo is the fallback. |
 | GitHub Actions | CI/CD | Builds and deploys blocked. Manual deploy is the fallback. |
 

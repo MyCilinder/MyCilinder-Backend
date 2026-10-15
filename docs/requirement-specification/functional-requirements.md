@@ -50,7 +50,7 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 | FR-AUTH-06 | A user can log out, which revokes the refresh token. | S |
 | FR-AUTH-07 | A user can reset a forgotten password with an emailed code. | S |
 | FR-AUTH-08 | A user can view their profile and change their display name. | S |
-| FR-AUTH-09 | A user can delere their profile and change their profile picture. `[TBD]`| W |
+| FR-AUTH-09 | A user can delete their profile and change their profile picture. `[TBD]`| W |
 
 ---
 

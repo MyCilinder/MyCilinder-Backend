@@ -40,7 +40,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | SEC-01 | **Authentication:** all mutating endpoints and user-specific reads require a valid Cognito-issued JWT. Tokens are validated at the edge (API Gateway/ALB) **and** re-checked by each service (signature, expiry, audience). | NFR6 |
 | SEC-02 | **Authorization:** services enforce ownership checks (BR-02) server-side. Client-supplied user IDs are never trusted; identity comes from the token. | NFR6 |
 | SEC-03 | **Transport:** TLS 1.2 or higher on all external traffic. HTTP is redirected or refused. | NFR6 |
-| SEC-04 | **Encryption at rest:** S3 buckets, RDS, and Redis use encryption at rest (provider-managed keys are acceptable for the MVP). | NFR6 |
+| SEC-04 | **Encryption at rest:** S3 buckets, Aurora, and Redis use encryption at rest (provider-managed keys are acceptable for the MVP). | NFR6 |
 | SEC-05 | **No public buckets:** S3 Block Public Access is on for all buckets. Uploads use short-lived presigned URLs scoped to one object key and size limit. Playback uses signed CloudFront URLs or cookies. Buckets are reachable by CloudFront only through origin access control. | NFR6, R7 |
 | SEC-06 | **Least privilege IAM:** each service has its own task role granting only the actions and resources it needs. No wildcard administrator roles at runtime. | NFR6, R7 |
 | SEC-07 | **Input validation:** all inputs are validated for type, length, and format. SQL access uses parameterized queries only. Comment and description text is stored raw and escaped on output by clients. | NFR6 |
@@ -48,7 +48,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | SEC-09 | **Rate limiting and quotas:** per-user and per-IP limits at the API edge (starting values: 100 requests/min per user for reads, 20/min for writes, 1 upload/minute). Login endpoints are throttled to resist credential stuffing. | NFR6, R10 |
 | SEC-10 | **Secrets:** no secrets in source control or container images. They are stored in AWS Secrets Manager or SSM Parameter Store and injected at runtime. | NFR6 |
 | SEC-11 | **Password policy and account protection:** enforced by Cognito (minimum length and complexity, email verification, throttling). No password is ever stored or logged by our services. | NFR6 |
-| SEC-12 | **Privacy:** collect only email and display name. Do not log tokens, passwords, or full email addresses. Logs avoid personal data beyond opaque user IDs. | NFR6, C-13 |
+| SEC-12 | **Privacy:** collect only email and display name. Do not log tokens, passwords, or full email addresses. Logs avoid personal data beyond opaque user IDs. | NFR6, C-12 |
 | SEC-13 | **CORS:** only the known web origin(s) (Vercel domain, local dev) are allowed. | NFR6 |
 | SEC-14 | **Supply chain and IaC scanning in CI:** dependency vulnerability scanning for Go and Python, container image scanning, and `tfsec`/checkov on Terraform. Critical findings block merge. | NFR6, R7 |
 | SEC-15 | **Audit trail:** moderation actions (hide/restore) and authentication events are logged with actor, target, and time. | NFR6, NFR7 |
@@ -81,7 +81,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | REL-01 | **Availability of the read/playback path** (browse, detail, playback URL, CDN) | 99.9% monthly ≈ **43.8 min** downtime per month | Best effort | NFR2 |
 | REL-02 | Availability of write paths (upload, comment, like) | 99.5% | Best effort | NFR2 |
 | REL-03 | Upload and transcoding are asynchronous and may be delayed, but accepted uploads must not be lost. | Zero lost accepted uploads | Same | NFR2, NFR4 |
-| REL-04 | **RPO** (maximum data loss) for relational data | ≤ 5 min (RDS point-in-time recovery + Multi-AZ) | ≤ 24 h (daily snapshot) | NFR2, NFR4 |
+| REL-04 | **RPO** (maximum data loss) for relational data | ≤ 5 min (Aurora point-in-time recovery + reader replica in a second AZ) | ≤ 24 h (daily snapshot) | NFR2, NFR4 |
 | REL-05 | **RTO** for loss of one Availability Zone | ≤ 15 min, automatic | Not guaranteed | NFR2 |
 | REL-06 | **RTO** for loss of the whole region | ≤ 4 h by re-provisioning with Terraform and restoring data (documented, not exercised in the MVP) | Out of scope | NFR2 |
 | REL-07 | Source media durability | S3 durability. Versioning enabled on `raw`. | Same | NFR4, R9 |
@@ -90,17 +90,17 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 
 | ID | Requirement |
 |----|-------------|
-| REL-10 | **No single point of failure** in the design: services run as at least 2 tasks across 2 AZs; RDS Multi-AZ; Redis with a replica in another AZ. |
+| REL-10 | **No single point of failure** in the design: services run as at least 2 tasks across 2 AZs; Aurora writer plus reader replica in separate AZs; Redis with a replica in another AZ. |
 | REL-11 | **Stateless services:** no local session or file state, so any task can be killed and replaced. Health checks (`/healthz` liveness, `/readyz` readiness) drive automatic replacement. |
 | REL-12 | **Graceful degradation, by dependency:**<br>• Redis down: serve counts from PostgreSQL (slower, still correct).<br>• Interactions service down: playback and browsing continue.<br>• Transcoder or queue down: uploads are accepted and wait; nothing is lost.<br>• Cognito down: users with valid tokens continue; new logins fail. |
 | REL-13 | **Timeouts, retries, and circuit breakers** on every synchronous call. Retries use exponential backoff with jitter and apply only to idempotent operations. |
 | REL-14 | **Queue safety:** at-least-once delivery, idempotent consumers, visibility timeout longer than the transcode time, a dead-letter queue after 3 attempts, and an alarm on DLQ depth. |
 | REL-15 | **Idempotent writes:** likes and view events are idempotent by design. Upload requests accept a client-supplied idempotency key. |
-| REL-16 | **Backups:** automated RDS backups with point-in-time recovery. A restore is tested at least once before the Deployment gate. |
+| REL-16 | **Backups:** automated Aurora backups with point-in-time recovery. A restore is tested at least once before the Deployment gate. |
 | REL-17 | **Safe deployments:** rolling deployment with health-check gating and automatic rollback on failed health checks. Database migrations are backward compatible with the previous release. |
 | REL-18 | **Composite availability:** the read path is a serial chain (CDN, edge, service, cache/DB). Its availability is roughly the product of the parts, so Multi-AZ and caching are used to keep each link above the 99.9% target. Provider SLAs are verified in Design. |
 
-> **Demo deviation (documented, deliberate):** Multi-AZ RDS and redundant Redis roughly double data-tier cost. The demo may run single-AZ with a single task per service to save credits. The design and Terraform modules support the Multi-AZ configuration via variables, and this deviation is called out in the design and test reports.
+> **Demo deviation (documented, deliberate):** The Aurora reader replica and redundant Redis roughly double data-tier cost. The demo may run single-AZ with a single task per service to save credits. The design and Terraform modules support the Multi-AZ configuration via variables, and this deviation is called out in the design and test reports.
 
 ---
 

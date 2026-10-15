@@ -1,0 +1,38 @@
+openapi: 3.2.1
+info:
+  title: MyCilinder
+  description: A VOD/OTT application that supports 1M DAU.
+  version: 1.0.0
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /uploads:
+    get:
+      description: Placeholder description
+      responses:
+        '200':
+          description: Placeholder description
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/pet'
+components:
+  schemas:
+    pet:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        name:
+          type: string
+          example: "Buddy"
+        status:
+          type: string
+          example: "available"

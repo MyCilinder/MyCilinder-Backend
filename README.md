@@ -170,7 +170,7 @@ The project follows a classic **waterfall** lifecycle. Each phase has a gate (ex
 
 | # | Risk | Category | L | I | Score | Severity | Mitigation | Contingency |
 |---|------|----------|---|---|-------|----------|------------|-------------|
-| R1 | **AWS credits exhausted** by transcoding + CDN egress | Cost | 4 | 5 | 20 | **High** | Keep data path off compute; cap video resolution/length; prefer `ffmpeg` on spot/Fargate over MediaConvert if cheaper; AWS Budgets alarms at 50/75/90%; nightly cost review | Freeze non-essential services; serve from S3 directly without CDN for demo; teardown idle resources |
+| R1 | **AWS credits exhausted** by transcoding + CDN egress | Cost | 4 | 5 | 20 | **High** | Keep data path off compute; cap video resolution/length; prefer `ffmpeg` on spot/Fargate over MediaConvert; AWS Budgets alarms at 50/75/90%; nightly cost review | Freeze non-essential services; serve from S3 directly without CDN for demo; teardown idle resources |
 | R2 | **Transcoding is slow/expensive** at scale | Technical | 4 | 4 | 16 | **High** | Async queue (SQS) decouples upload from processing; limit renditions (e.g., 360p/720p only for MVP); cap input duration | Process a curated demo set offline; show pipeline on small files |
 | R3 | **Scope creep** (live streaming, recommendations, moderation) | Project | 1 | 3 | 12 | Medium | Scope frozen in §1.1; change requests required post-Design freeze | Defer to "future work" section |
 | R4 | **Polyglot coordination overhead** (3 languages) | Technical/Team | 3 | 3 | 9 | Medium | Deliberately small split (§6); shared OpenAPI contract; containerize every service identically | Consolidate a struggling service into the team's strongest language |
@@ -198,8 +198,8 @@ The project follows a classic **waterfall** lifecycle. Each phase has a gate (ex
 |--------|----------|-----|
 | **Catalog / Metadata API** (videos, feed, search) | **Go** | High-throughput, low-latency read path; cheap concurrency; small memory footprint keeps compute cost down — matters directly for the credit budget. |
 | **Interactions** (comments, likes, view counts) | **Go** | Same hot-path/concurrency reasons; counters + fan-out benefit from Go's lightweight goroutines. |
-| **Upload / Ingest + Transcoder worker** | **Python** | Rich media ecosystem (ffmpeg bindings, boto3, MediaConvert SDK); this path is async and not latency-critical, so Python's throughput ceiling is irrelevant here. |
-| **(Shared) Auth facade** | thin service in **Go** (or Python) | Wraps Cognito so the client never couples to the provider directly (mitigates R6). |
+| **Upload / Ingest + Transcoder worker** | **Python** | Rich media ecosystem (ffmpeg bindings, boto3); this path is async and not latency-critical, so Python's throughput ceiling is irrelevant here. |
+| **(Shared) Auth facade** | thin service in **Go** | Wraps Cognito so the client never couples to the provider directly (mitigates R6). |
 
 
 ### 6.3 Full stack
@@ -212,10 +212,10 @@ The project follows a classic **waterfall** lifecycle. Each phase has a gate (ex
 | **Compute** | **ECS Fargate** (containers) | Stateless services; scales to zero/low for demo. Avoids EC2 management. |
 | **Async messaging** | **SQS** (+ SNS/EventBridge) | Decouples upload from transcoding; buffers spikes. |
 | **Object storage** | **S3** | Separate `raw` (versioned) and `output` (HLS) buckets. No public write. |
-| **Transcoding** | **AWS MediaConvert** *or* **ffmpeg on Fargate** | Decide by cost during Design; ffmpeg-on-Fargate likely cheaper for the budget. |
+| **Transcoding** | **ffmpeg on Fargate** | Decide by cost during Design; ffmpeg-on-Fargate likely cheaper for the budget. |
 | **CDN** | **CloudFront** | Signed URLs; caches HLS segments; the main playback path. |
-| **Relational DB** | **RDS PostgreSQL** (Aurora Serverless v2 if credits allow) | Users, videos, comments metadata. |
-| **Cache / counters** | **ElastiCache Redis** (or DynamoDB) | View counts, like counts, hot feed cache. |
+| **Relational DB** | **Aurora PostgreSQL** (writer + reader replica) | Users, videos, comments metadata. |
+| **Cache / counters** | **ElastiCache Redis** | View counts, like counts, hot feed cache. |
 | **Search** | PostgreSQL full-text (MVP) → OpenSearch later | Keep it cheap for MVP. |
 | **IaC** | **Terraform** | Separate repo; `tfsec`/checkov in CI (R7). |
 | **CI/CD** | GitHub Actions | Build/test/containerize per service; Terraform plan/apply gated. |
