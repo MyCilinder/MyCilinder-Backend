@@ -56,25 +56,25 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 | NFR3 | **Latency** | Playback start (CDN cache hit) < 2 s; API reads (p95) < 300 ms. |
 | NFR4 | **Durability** | No loss of uploaded source media (S3 11-nines durability). |
 | NFR5 | **Cost control** | Hard guardrails + budget alarms; data path kept off compute wherever possible. |
-| NFR6 | **Security** | Managed auth (Cognito), least-privilege IAM, no public write buckets, signed URLs for media. |
+| NFR6 | **Security** | Managed auth (Cognito), least-privilege IAM, no public write buckets, signed access (CloudFront signed cookies) for video media. |
 | NFR7 | **Observability** | Centralized logs/metrics/traces; every service emits health + key business metrics. |
 
 ---
 
 ## 3. Architecture (high level)
 
-**Style:** microservices, stateless where possible, communicating over HTTP (synchronous) and SQS/SNS/EventBridge (asynchronous). The **media data path is kept off the application compute** — clients upload directly to S3 via presigned URLs and play back through CloudFront. Services only handle metadata and orchestration.
+**Style:** microservices, stateless where possible, communicating over HTTP (synchronous) and SQS/SNS (asynchronous). The **media data path is kept off the application compute** — clients upload directly to S3 via presigned URLs and play back through CloudFront. Services only handle metadata and orchestration.
 
 ![MyCilinder high-availability AWS architecture](docs/diagrams/architecture.png)
 
-*Figure 1 — Target (design-scale) architecture. The deployed demo runs a throttled subset of this topology.*
+*Figure 1 — Target (design-scale) architecture. The deployed demo runs a throttled subset of this topology. Since the design review, the API is also served through CloudFront under `/api/*` and no custom domain is used (see [Architecture and Components](docs/design-description/architecture-and-components.md) §2.1 and §5).*
 
 **Upload → playback flow**
 1. Client requests a presigned upload URL from the Upload service.
-2. Client PUTs the raw file **directly to S3** (API never touches the bytes).
+2. Client uploads the raw file **directly to S3** (API never touches the bytes).
 3. S3 `ObjectCreated` event → SQS → Transcoder worker.
-4. Worker produces adaptive-bitrate HLS renditions, writes them to the output bucket, updates metadata status to `READY`.
-5. Viewers stream HLS via CloudFront; the API only serves metadata + signed playback URLs.
+4. Worker produces adaptive-bitrate HLS renditions, writes them to the output bucket, and publishes a `video.ready` event; Catalog sets the status to `READY`.
+5. Viewers stream HLS via CloudFront; the API only serves metadata + signed playback cookies.
 
 ### 3.1 Architecture drivers
 
@@ -87,9 +87,9 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 ### 3.2 Component description
 
 **Edge (global services)**
-- **Route 53** resolves the public domain; **AWS WAF** protects CloudFront and API Gateway with managed and rate-based rules.
-- **CloudFront** is the only playback entry point. It caches HLS manifests and segments, enforces signed URLs, and reads the private output bucket through Origin Access Control (OAC).
-- **API Gateway (HTTP API)** is the single API entry point. It applies throttling, validates the **Cognito** JWT, and forwards traffic to the VPC through a **VPC Link**.
+- **CloudFront** is the only public entry point, on its default `*.cloudfront.net` domain (no custom domain, so no Route 53 zone is needed). It serves the API under `/api/*` and media under `/videos/*` and `/thumbnails/*`, caches HLS manifests and segments, enforces signed cookies on video media, and reads the private output bucket through Origin Access Control (OAC).
+- **AWS WAF** is attached to the CloudFront distribution, with managed rules and a per-IP rate-based rule.
+- **API Gateway (HTTP API)** is the CloudFront origin for `/api/*`. It applies throttling, validates the **Cognito** JWT, and forwards traffic to the VPC through a **VPC Link**.
 
 **Network (VPC across two Availability Zones)**
 - Three subnet tiers per AZ: **public** (NAT Gateway), **private-app** (ECS tasks), and **private-data** (Aurora, Redis, no internet route).
@@ -103,19 +103,19 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 | Auth facade | Go | Register/login/refresh over Cognito; stable `/auth` contract for the client | CPU / requests |
 | Catalog / Metadata API | Go | Videos, feed, search, video detail; consumes `READY` status events | CPU / requests |
 | Interactions API | Go | Comments, likes, views; counters kept in Redis and flushed asynchronously to Aurora | CPU / requests |
-| Upload / Ingest API | Python | Validates quotas, creates the video record, returns the presigned S3 PUT URL | CPU / requests |
+| Upload / Ingest API | Python | Validates quotas, creates the video record, returns the presigned S3 upload URL(s) | CPU / requests |
 | Transcoder worker | Python + ffmpeg | Consumes the transcode queue, produces 360p/720p HLS, publishes a `video-events` message | Queue depth (Spot) |
 
 **Data, storage, and messaging**
 - **S3 `raw-videos`** (versioned, private) receives uploads via presigned URLs; **S3 `hls-output`** (private) is readable only through CloudFront.
 - **Aurora PostgreSQL** has a writer in AZ-a and a reader replica in AZ-b with automatic failover. **ElastiCache Redis** has a primary and replica in separate AZs and holds the hot feed cache and counters.
-- S3 `ObjectCreated` feeds the **SQS `transcode-queue`** (with a dead-letter queue). On completion the worker publishes to the **SNS `video-events`** topic; a subscribed SQS queue lets Catalog mark the video `READY` or `FAILED`.
+- S3 `ObjectCreated` feeds the **SQS `transcode-queue`** (with a dead-letter queue). On completion the worker publishes to the **SNS `video-events`** topic; the subscribed **SQS `video-status-queue`** lets Catalog mark the video `READY` or `FAILED`.
 
 **Operations:** CloudWatch (logs, metrics, alarms) and X-Ray (traces) receive data from every service; ECR stores images, Secrets Manager holds credentials, and AWS Budgets raises billing alarms.
 
 ### 3.3 High-availability strategy
 
-The key decision is that **playback does not depend on the VPC, the containers, or the database**: once a client has a signed URL, delivery is CloudFront → S3 only. An application-tier failure degrades browsing and interactions but not videos already playing.
+The key decision is that **playback does not depend on the VPC, the containers, or the database**: once a client has its signed playback cookies, delivery is CloudFront → S3 only. An application-tier failure degrades browsing and interactions but not videos already playing.
 
 | Failure scenario | Behavior |
 |------------------|----------|
@@ -130,7 +130,7 @@ Durability: S3 provides 11-nines durability with versioning on the raw bucket, a
 ### 3.4 Scalability and security
 
 - **Scalability:** services are stateless and scale horizontally behind the ALB; CloudFront, Redis, and Aurora readers absorb read load; like/view counters are batched into Aurora to avoid write hotspots; transcoding scales out and back to zero on queue depth. Known limits at 1M DAU: search should move to OpenSearch and comment writes may need sharding (§7).
-- **Security:** the only public surfaces are CloudFront and API Gateway, both behind WAF. Each ECS service has its own least-privilege task role, data is encrypted at rest and in transit, and secrets live in Secrets Manager.
+- **Security:** the only public surface is CloudFront, behind WAF. API Gateway's own endpoint rejects requests that do not carry CloudFront's secret origin header. Each ECS service has its own least-privilege task role, data is encrypted at rest and in transit, and secrets live in Secrets Manager.
 
 ---
 
@@ -172,11 +172,11 @@ The project follows a classic **waterfall** lifecycle. Each phase has a gate (ex
 |---|------|----------|---|---|-------|----------|------------|-------------|
 | R1 | **AWS credits exhausted** by transcoding + CDN egress | Cost | 4 | 5 | 20 | **High** | Keep data path off compute; cap video resolution/length; prefer `ffmpeg` on spot/Fargate over MediaConvert; AWS Budgets alarms at 50/75/90%; nightly cost review | Freeze non-essential services; serve from S3 directly without CDN for demo; teardown idle resources |
 | R2 | **Transcoding is slow/expensive** at scale | Technical | 4 | 4 | 16 | **High** | Async queue (SQS) decouples upload from processing; limit renditions (e.g., 360p/720p only for MVP); cap input duration | Process a curated demo set offline; show pipeline on small files |
-| R3 | **Scope creep** (live streaming, recommendations, moderation) | Project | 1 | 3 | 12 | Medium | Scope frozen in §1.1; change requests required post-Design freeze | Defer to "future work" section |
+| R3 | **Scope creep** (live streaming, recommendations, moderation) | Project | 1 | 3 | 3 | Low | Scope frozen in §1.1; change requests required post-Design freeze | Defer to "future work" section |
 | R4 | **Polyglot coordination overhead** (3 languages) | Technical/Team | 3 | 3 | 9 | Medium | Deliberately small split (§6); shared OpenAPI contract; containerize every service identically | Consolidate a struggling service into the team's strongest language |
 | R5 | **Waterfall late-integration failure** | Process | 3 | 4 | 12 | Medium | Walking-skeleton end-to-end first; API frozen early | Reserve integration buffer before Testing gate |
 | R6 | **Cognito lock-in / limited UX customization** | Technical | 2 | 2 | 4 | Low | Abstract auth behind our own `/auth` facade so client isn't coupled to Cognito SDK specifics | Swap provider behind the facade if needed |
-| R7 | **Security misconfiguration** (public buckets, open IAM) | Security | 3 | 5 | 15 | **High** | Terraform-only infra (reviewed), no public write, signed URLs, least-privilege IAM, `tfsec`/checkov in CI | Rotate credentials; lock down and re-provision |
+| R7 | **Security misconfiguration** (public buckets, open IAM) | Security | 3 | 5 | 15 | **High** | Terraform-only infra (reviewed), no public write, signed playback access, least-privilege IAM, `tfsec`/checkov in CI | Rotate credentials; lock down and re-provision |
 | R8 | **Team member unavailability** (school project) | Team | 3 | 3 | 9 | Medium | Service ownership documented + a backup owner each; small services | Redistribute ownership; cut lowest-priority service |
 | R9 | **Data loss of source uploads** | Technical | 1 | 5 | 5 | Low | S3 versioning on raw bucket; raw media never deleted by pipeline | Reprocess from retained raw objects |
 | R10 | **Unexpected traffic/cost spike** (abuse, runaway loop) | Cost/Ops | 2 | 4 | 8 | Medium | Rate limiting at API Gateway; upload quotas; billing alarms | Throttle/disable upload; investigate before re-enabling |
@@ -190,7 +190,7 @@ The project follows a classic **waterfall** lifecycle. Each phase has a gate (ex
 ### 6.1 Guiding principles
 - **Keep the media data path off application compute** (presigned S3 uploads, CloudFront delivery). This is the #1 cost and scalability lever.
 - **Managed over self-hosted** wherever the free tier allows — less ops burden for a student team.
-- **Polyglot, but deliberately minimal:** two languages, each chosen for a clear reason..
+- **Polyglot, but deliberately minimal:** two languages, each chosen for a clear reason.
 
 ### 6.2 Backend languages (per module)
 
@@ -208,15 +208,15 @@ The project follows a classic **waterfall** lifecycle. Each phase has a gate (ex
 |-------|--------|-------|
 | **Client** | Flutter (web + Android) | Separate repo. HLS playback via platform players. |
 | **Auth** | **AWS Cognito** | 50k MAU free tier; native API Gateway/ALB integration; JWT. Fronted by our auth facade. |
-| **API edge** | API Gateway **or** ALB | API Gateway for managed auth + throttling; ALB if services run on ECS behind a single LB. |
+| **API edge** | CloudFront + WAF → API Gateway (HTTP API) → VPC Link → internal ALB | API Gateway for JWT validation + throttling; the ALB routes by path to the ECS services. |
 | **Compute** | **ECS Fargate** (containers) | Stateless services; scales to zero/low for demo. Avoids EC2 management. |
-| **Async messaging** | **SQS** (+ SNS/EventBridge) | Decouples upload from transcoding; buffers spikes. |
+| **Async messaging** | **SQS** + **SNS** | Decouples upload from transcoding; buffers spikes. |
 | **Object storage** | **S3** | Separate `raw` (versioned) and `output` (HLS) buckets. No public write. |
-| **Transcoding** | **ffmpeg on Fargate** | Decide by cost during Design; ffmpeg-on-Fargate likely cheaper for the budget. |
-| **CDN** | **CloudFront** | Signed URLs; caches HLS segments; the main playback path. |
-| **Relational DB** | **Aurora PostgreSQL** (writer + reader replica) | Users, videos, comments metadata. |
+| **Transcoding** | **ffmpeg on Fargate Spot** | Chosen over MediaConvert for cost. |
+| **CDN** | **CloudFront** | Signed cookies; caches HLS segments; the main playback path and the API entry point. |
+| **Relational DB** | **Aurora PostgreSQL Serverless v2** (writer + reader replica) | Users, videos, comments metadata. |
 | **Cache / counters** | **ElastiCache Redis** | View counts, like counts, hot feed cache. |
-| **Search** | PostgreSQL full-text (MVP) → OpenSearch later | Keep it cheap for MVP. |
+| **Search** | PostgreSQL full-text, Spanish configuration (MVP) → OpenSearch later | Keep it cheap for MVP. |
 | **IaC** | **Terraform** | Separate repo; `tfsec`/checkov in CI (R7). |
 | **CI/CD** | GitHub Actions | Build/test/containerize per service; Terraform plan/apply gated. |
 | **Observability** | CloudWatch (logs/metrics/alarms) + X-Ray | Billing alarms are mandatory (R1). |
@@ -244,12 +244,26 @@ The project follows a classic **waterfall** lifecycle. Each phase has a gate (ex
 ```
 MyCilinder-Backend/
 ├── README.md
+├── services/            # auth, catalog, interactions (Go); upload, transcoder (Python)
+├── libs/                # shared go/ and python/ libraries
+├── migrations/          # SQL migrations per schema
+├── deploy/local/        # Docker Compose
+├── .github/workflows/   # CI/CD per service
 └── docs/
     ├── requirement-specification/
     │   ├── overall-description.md
     │   ├── functional-requirements.md
     │   └── non-functional-requirements.md
     ├── design-description/
+    │   ├── overview.md
+    │   ├── architecture-and-components.md
+    │   ├── data-design.md
+    │   └── interface-design.md
     ├── testing-plan/
+    │   └── software-test-plan.md
+    ├── diagrams/
+    │   └── architecture.png
     └── openapi.yaml
 ```
+
+The code folders are created in Implementation; their contents are described in [Architecture and Components](docs/design-description/architecture-and-components.md) §4.5.

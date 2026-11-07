@@ -7,7 +7,6 @@ Related: [Architecture and Components](./architecture-and-components.md) · [Dat
 - Entry point of the design description. It adds context, decisions, vocabulary, and audience. It does not restate the [README](../../README.md) or the Requirement Specification; it points to them.
 - IDs (`FR-*`, `PERF-*`, `SEC-*`, `REL-*`, `SCAL-*`, `MAINT-*`, `BR-*`, `C-*`, `A-*`, `R*`, `O*`) refer to those documents.
 - **Design target** is what the architecture must be able to reach (100k–1M DAU). **Demo target** is what is deployed within the AWS credits.
-- `[TBC]` marks an open item.
 
 ---
 
@@ -33,7 +32,7 @@ MyCilinder is a video-on-demand (VOD) platform with the core experience of a ser
 | Document | Covers |
 |----------|--------|
 | Overview (this document) | Background, scope, decisions, glossary, audience. |
-| [Architecture and Components](./architecture-and-components.md) | Pattern, diagrams, stack, modules, design review findings. |
+| [Architecture and Components](./architecture-and-components.md) | Pattern, diagrams, stack, modules, repository layout, design review findings. |
 | [Data Design](./data-design.md) | ERD, schemas, data flow, caching and storage. |
 | [Interface Design](./interface-design.md) | APIs, integrations, reference to [`openapi.yaml`](../openapi.yaml). |
 
@@ -44,7 +43,7 @@ The design covers the **backend**. The Terraform and Flutter repos appear only a
 Frozen at the Design gate; later changes need a change request (C-06). The authoritative lists are README §1.1 and the SRS functions PF1–PF8.
 
 - **Included:** accounts through the `/auth` facade, direct-to-S3 upload, asynchronous HLS transcoding, CDN playback, feeds and search, comments / likes / counters, creator studio, reporting hooks with restricted operator endpoints, and a multi-AZ, autoscaled, observable deployment.
-- **Excluded:** live streaming, monetization, recommendations, DRM, moderation beyond reporting hooks, private / unlisted videos, threaded comments, a full bitrate ladder, multi-region, formal regulatory compliance (C-12), and validation under real production load (A-04).
+- **Excluded:** live streaming, monetization, recommendations and ranked feeds (feeds only sort by most recent or most viewed), DRM, moderation beyond reporting hooks, private / unlisted videos, threaded comments, editing or deleting comments, password reset, retrying a failed video, a full bitrate ladder, multi-region, formal regulatory compliance (C-12), and validation under real production load (A-04).
 
 ### 2.3 Design objectives
 
@@ -70,11 +69,14 @@ Terraform variables switch between the two. HA behavior the demo does not exerci
 |---|----------|---------|--------------------|
 | P1 | Region | **`us-east-1`** | Team decision. Broad service coverage and quotas; CloudFront-attached resources (WAF web ACLs, ACM certificates) must live there. Playback latency does not depend on it because media comes from the CDN. |
 | P2 | Transcoding | **ffmpeg on Fargate Spot** | README §3.1, §3.2. |
-| P3 | Relational database | **Aurora PostgreSQL** | README §3.2. The AWS Free plan offers only the *serverless* flavor, up to 4 ACU and 1 GiB per cluster `[TBC: confirm in the account]`. |
+| P3 | Relational database | **Aurora PostgreSQL Serverless v2** | README §3.2. The account is on the AWS Free plan with credits, which offers only the serverless flavor, up to 4 ACU and 1 GiB per cluster. |
 | P4 | Cache and counters | **ElastiCache Redis** | README §3.2. |
 | P5 | Auth facade | **Go** | README §3.2. |
 | P6 | Environments | Local (Docker Compose), AWS development, AWS demo | Overall Description §3. All AWS environments share the same credits. |
-| P7 | Operator actions | **Restricted endpoints** | Team decision; specified in the Interface Design. |
+| P7 | Operator actions | **Restricted endpoints** under `/ops/*`, for members of the Cognito `operators` group | Team decision; specified in the Interface Design §1.2. |
+| P8 | Public domain | **Default CloudFront domain** (`*.cloudfront.net`), no custom domain | Team decision: cheapest option. It needs no domain registration, Route 53 hosted zone, or certificate, and CloudFront provides TLS for it. |
+| P9 | API entry point | **API served through CloudFront** (`/api/*`) with WAF attached to the distribution | Design review F1 (Architecture §5). It also puts API and media on one domain for signed cookies (F2). |
+| P10 | Storage lifecycle | **Raw uploads move to S3 Glacier Flexible Retrieval after 30 days; HLS outputs of deleted videos are removed after 7 days** | Team decision (NFR §5.9). Raw uploads are still never deleted (BR-05). Details in the Data Design §3.3. |
 
 ---
 

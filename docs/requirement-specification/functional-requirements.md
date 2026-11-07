@@ -18,13 +18,14 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 
 | Status | Meaning | Visible in catalog? | Next states |
 |--------|---------|---------------------|-------------|
-| `PENDING_UPLOAD` | Record created, waiting for the file to land in S3. | No | `UPLOADED`, expired |
-| `UPLOADED` | File received, job queued. | No | `PROCESSING` |
+| `PENDING_UPLOAD` | Record created, waiting for the file to land in S3. | No | `UPLOADED`, `EXPIRED` |
+| `UPLOADED` | File received, job queued. **Transient:** it is not stored, and the stored status stays `PENDING_UPLOAD` until a worker starts the job. | No | `PROCESSING` |
 | `PROCESSING` | Validation and transcoding in progress. | No | `READY`, `FAILED` |
 | `READY` | Renditions and thumbnail available. | **Yes** | `HIDDEN`, `DELETED` |
-| `FAILED` | Validation or transcoding failed after retries. Reason is stored. | No | (retry creates a new attempt) |
-| `HIDDEN` | Unpublished by an operator after a report. | No | `READY` |
+| `FAILED` | Validation or transcoding failed after retries. Reason is stored. | No | `DELETED` |
+| `HIDDEN` | Unpublished by an operator after a report. | No | `READY`, `DELETED` |
 | `DELETED` | Removed by the owner. | No | terminal |
+| `EXPIRED` | The file never arrived within the pending-upload expiry (BR-LIM). | No | terminal |
 
 ---
 
@@ -48,9 +49,9 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 | FR-AUTH-04 | A client can exchange a valid refresh token for a new access token. | M |
 | FR-AUTH-05 | On first successful login, the system creates a local user profile keyed by the Cognito `sub`. | M |
 | FR-AUTH-06 | A user can log out, which revokes the refresh token. | S |
-| FR-AUTH-07 | A user can reset a forgotten password with an emailed code. | S |
+| FR-AUTH-07 | Resetting a forgotten password is not supported in the MVP. | W |
 | FR-AUTH-08 | A user can view their profile and change their display name. | S |
-| FR-AUTH-09 | A user can delete their profile and change their profile picture. `[TBD]`| W |
+| FR-AUTH-09 | A user can delete their profile and change their profile picture. | W |
 
 ---
 
@@ -63,7 +64,7 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 |-------|------------|--------|
 | Title, description, file name, content type, file size | Authenticate, check limits and quota (BR-LIM), create record in `PENDING_UPLOAD` | `videoId` and presigned upload URL (or multipart URLs) with short expiry |
 | File bytes (client to S3) | S3 stores object in the `raw` bucket and emits `ObjectCreated` | Event on the queue |
-| `ObjectCreated` event | Mark `UPLOADED`, enqueue transcode job | Job message |
+| `ObjectCreated` event | Enqueue transcode job (`UPLOADED`, transient) | Job message |
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
@@ -72,9 +73,9 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 | FR-UP-03 | The system creates a video record in `PENDING_UPLOAD` and returns the `videoId` and a presigned URL that expires in a short time (BR-LIM). | M |
 | FR-UP-04 | The file is uploaded directly from the client to the `raw` bucket. | M |
 | FR-UP-05 | Large files can be uploaded using multipart/resumable upload. | S |
-| FR-UP-06 | When the object is created, the system sets the status to `UPLOADED` and enqueues exactly one transcode job per object. | M |
+| FR-UP-06 | When the object is created, the system enqueues exactly one transcode job per object. `UPLOADED` is transient: the stored status moves from `PENDING_UPLOAD` to `PROCESSING` when a worker starts the job. | M |
 | FR-UP-07 | The system inspects the real file (container, codec, duration, resolution) and rejects files that violate limits, regardless of what the client declared. The video becomes `FAILED` with a reason. | M |
-| FR-UP-08 | Records stuck in `PENDING_UPLOAD` for more than 24 h expire, and incomplete multipart uploads are aborted. | S |
+| FR-UP-08 | Records stuck in `PENDING_UPLOAD` for more than 24 h become `EXPIRED`, and incomplete multipart uploads are aborted. | S |
 | FR-UP-09 | A user can only obtain upload URLs for videos they own. | M |
 
 ---
@@ -94,9 +95,9 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 | FR-TR-01 | The worker consumes jobs from the queue. Processing must be **idempotent**, because delivery is at-least-once. | M |
 | FR-TR-02 | The worker produces HLS renditions at 360p and 720p with a master playlist. It never upscales: a source below 720p yields only the renditions at or below its resolution. | M |
 | FR-TR-03 | The worker generates a thumbnail image. | M |
-| FR-TR-04 | Outputs are written to the `output` bucket under `videos/{videoId}/`. The `raw` object is never modified or deleted by the pipeline. | M |
+| FR-TR-04 | HLS outputs are written to the `output` bucket under `videos/{videoId}/` and the thumbnail as `thumbnails/{videoId}.jpg`. The `raw` object is never modified or deleted by the pipeline. | M |
 | FR-TR-05 | On success, the status becomes `READY`, and duration and available renditions are stored. | M |
-| FR-TR-06 | A failed job is retried up to 3 times, then moved to a dead-letter queue. The video becomes `FAILED` with a human-readable reason. | M |
+| FR-TR-06 | A failed job is attempted up to 3 times in total, then moved to a dead-letter queue. The video becomes `FAILED` with a human-readable reason. | M |
 | FR-TR-07 | The status moves to `PROCESSING` when a worker starts a job. | M |
 | FR-TR-08 | The owner is notified (email or push) when a video becomes `READY` or `FAILED`. | C |
 
@@ -104,19 +105,19 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 
 ### 1.4 Playback (FR-PB)
 
-**Description:** Watching a video. The API returns metadata and a signed playback URL. The bytes come from CloudFront.
+**Description:** Watching a video. The API returns metadata and signed playback access. The bytes come from CloudFront.
 **Actors:** Guest, Registered User.
 
 | Input | Processing | Output |
 |-------|------------|--------|
 | `videoId` | Load metadata, check status | Video detail (title, description, creator, counts, thumbnail, status) |
-| `videoId` | Check access, sign CDN URL/cookie | Signed HLS master playlist URL with expiry |
+| `videoId` | Check access, sign CDN cookies | HLS master playlist URL and signed cookies with expiry |
 | View event | Deduplicate (BR-VIEW), increment counter | Updated view count (eventually consistent) |
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
 | FR-PB-01 | Any viewer can retrieve the detail of a `READY` video. The owner can also retrieve their own non-ready videos. | M |
-| FR-PB-02 | The system returns a signed, time-limited playback URL for the HLS master playlist. Unsigned access to media is denied. | M |
+| FR-PB-02 | The system returns the HLS master playlist URL and signed, time-limited access (CloudFront signed cookies) covering all of the video's playlists and segments. Unsigned access to video media is denied. | M |
 | FR-PB-03 | Playback is adaptive (HLS) and served through the CDN. | M |
 | FR-PB-04 | The system records a view when playback starts, applying the deduplication rule BR-VIEW. | M |
 | FR-PB-05 | Every video has a stable permalink (`/watch/{videoId}`) that opens the video for guests as well. | M |
@@ -133,19 +134,19 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 | Input | Processing | Output |
 |-------|------------|--------|
 | Feed type (recent / most viewed), cursor | Query `READY` videos, sort | Page of video cards + next cursor |
-| Search text, cursor | PostgreSQL full-text search on title and description | Ranked page of video cards + next cursor |
+| Search text, cursor | PostgreSQL full-text search (Spanish) on title and description | Ranked page of video cards + next cursor |
 | Creator id, cursor | Query creator's `READY` videos | Page of video cards |
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
 | FR-BR-01 | The system provides a "recent" feed, newest `READY` videos first. | M |
 | FR-BR-02 | The system provides a "most viewed" feed (all-time view count). | M |
-| FR-BR-03 | A user can search by keyword over title and description. Results are ranked by relevance. | M |
+| FR-BR-03 | A user can search by keyword over title and description, using Spanish language rules. Results are ranked by relevance. | M |
 | FR-BR-04 | All lists use cursor-based pagination with a bounded page size (BR-LIM). | M |
 | FR-BR-05 | Each list item includes thumbnail, title, creator display name, duration, view count, and publish date. | M |
 | FR-BR-06 | Lists only contain `READY` videos. | M |
 | FR-BR-07 | A public creator page lists that creator's videos. | S |
-| FR-BR-08 | "Most viewed in the last 7 days" feed. | C |
+| FR-BR-08 | Time-windowed feeds (such as "most viewed in the last 7 days") are not supported in the MVP. | W |
 | FR-BR-09 | Personalized recommendations and search suggestions are not supported in the MVP. | W |
 
 ---
@@ -165,12 +166,12 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 |----|-------------|----------|
 | FR-IN-01 | A registered user can post a text comment on a `READY` video. | M |
 | FR-IN-02 | Any viewer can list comments for a video, newest first, paginated. | M |
-| FR-IN-03 | A user can delete their own comment. | M |
-| FR-IN-04 | A video owner can delete any comment on their video. | S |
+| FR-IN-03 | Users cannot delete comments in the MVP, including their own. | W |
+| FR-IN-04 | Video owners cannot delete comments on their videos in the MVP. | W |
 | FR-IN-05 | A registered user can like a video. Repeating the request has no additional effect (idempotent). | M |
 | FR-IN-06 | A registered user can remove their like. | M |
 | FR-IN-07 | Video detail shows like count, comment count, and whether the current user has liked it. | M |
-| FR-IN-08 | A user can edit their own comment. | C |
+| FR-IN-08 | Editing comments is not supported in the MVP. | W |
 | FR-IN-09 | Threaded replies and comment likes are not supported in the MVP. | W |
 
 ---
@@ -186,7 +187,7 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 | FR-CR-02 | For a `FAILED` video, the creator can see the failure reason. | M |
 | FR-CR-03 | A creator can edit the title and description of their own video. | S |
 | FR-CR-04 | A creator can delete their own video. It disappears from all lists and playback immediately. | S |
-| FR-CR-05 | A creator can retry a `FAILED` video without re-uploading, if the raw file is still valid. | C |
+| FR-CR-05 | Retrying a `FAILED` video without re-uploading is not supported in the MVP. | W |
 
 ---
 
@@ -200,7 +201,7 @@ Many features depend on the status of a video. Statuses are the shared vocabular
 | FR-MOD-01 | A registered user can report a video or a comment with a reason category and optional text. | S |
 | FR-MOD-02 | A user cannot file more than one open report for the same target. | S |
 | FR-MOD-03 | Reports are stored and can be queried by an operator. | S |
-| FR-MOD-04 | An operator can set a video to `HIDDEN` or restore it, through a restricted endpoint or script. | S |
+| FR-MOD-04 | An operator can set a video to `HIDDEN` or restore it, and hide a reported comment, through restricted endpoints. | S |
 | FR-MOD-05 | Automated content scanning and appeals are not supported in the MVP. | W |
 
 ---
@@ -244,7 +245,7 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
   2. The client requests an upload from the Upload service.
   3. The service validates the request, creates the record in `PENDING_UPLOAD`, and returns `videoId` and a presigned URL.
   4. The client uploads the file directly to S3.
-  5. S3 emits `ObjectCreated`. The system sets `UPLOADED` and enqueues a job.
+  5. S3 emits `ObjectCreated`. The system enqueues a job (`UPLOADED`).
   6. The worker validates the file, transcodes it, and writes the outputs.
   7. The status becomes `READY`. The video appears in the catalog and in the creator's list.
 - **Alternate flows:**
@@ -252,7 +253,7 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
   - 4a. Upload interrupted: the client resumes (multipart) or requests a fresh URL.
   - 4b. URL expired: the client requests a new URL for the same `videoId`.
   - 6a. File invalid (wrong codec, too long, too large): the video becomes `FAILED` with a reason.
-  - 6b. Transcode error: retried up to 3 times, then `FAILED` and moved to the dead-letter queue.
+  - 6b. Transcode error: attempted up to 3 times, then `FAILED` and moved to the dead-letter queue.
 - **Postcondition:** The video is `READY` or `FAILED`. The raw file is retained in either case.
 
 ### UC-04 Watch a video
@@ -260,13 +261,13 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
 - **Preconditions:** The video is `READY`.
 - **Main flow:**
   1. The viewer opens a video from a list, search, or shared link.
-  2. The client fetches the video detail and a signed playback URL.
+  2. The client fetches the video detail and signed playback access.
   3. The player streams HLS from the CDN and adapts quality to bandwidth.
   4. The system records a view (deduplicated).
 - **Alternate flows:**
   - 1a. Opening a shared permalink works the same way for a guest.
   - 2a. Video is hidden, deleted, or unknown: the client shows "not found".
-  - 3a. Signed URL expired mid-session: the client requests a fresh one and continues.
+  - 3a. Signed access expired mid-session: the client requests fresh access and continues.
 - **Postcondition:** The view count is eventually incremented.
 
 ### UC-05 Browse and search
@@ -279,13 +280,12 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
 - **Postcondition:** None (read-only).
 
 ### UC-06 Comment on a video
-- **Actor:** Registered User. **Related:** FR-IN-01–04
+- **Actor:** Registered User. **Related:** FR-IN-01, 02
 - **Preconditions:** The user is logged in and the video is `READY`.
 - **Main flow:** The user types a comment and submits it. The system validates and stores it, and returns it.
 - **Alternate flows:**
   - a. Text empty or too long: the request is rejected.
   - b. Guest tries to comment: the client prompts for login.
-  - c. The user or the video owner deletes the comment: it is removed from the list.
 - **Postcondition:** The comment is visible to all viewers and the comment count is updated.
 
 ### UC-07 Like or unlike a video
@@ -295,11 +295,11 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
 - **Postcondition:** At most one like exists for the (user, video) pair.
 
 ### UC-08 Manage my videos
-- **Actor:** Creator. **Related:** FR-CR-01–05
+- **Actor:** Creator. **Related:** FR-CR-01–04
 - **Main flow:**
   1. The creator opens "My videos" and sees each video with its status.
   2. The creator edits a title or description, or deletes a video.
-- **Alternate flows:** 1a. A `FAILED` video displays its reason, with an optional retry (Could).
+- **Alternate flows:** 1a. A `FAILED` video displays its reason. To try again, the creator uploads the file as a new video.
 - **Postcondition:** Changes are reflected in the catalog. A deleted video is no longer visible or playable.
 
 ### UC-09 Report content
@@ -307,9 +307,9 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
 - **Main flow:**
   1. The user reports a video or comment and picks a reason.
   2. The system stores the report.
-  3. An operator reviews reports and may set the video to `HIDDEN`.
+  3. An operator reviews reports and may set the video to `HIDDEN` or hide the comment, then resolves or dismisses the report.
 - **Alternate flows:** 2a. A duplicate open report from the same user for the same target is rejected.
-- **Postcondition:** The report is recorded. A hidden video disappears from public views.
+- **Postcondition:** The report is recorded. Hidden content disappears from public views.
 
 ---
 
@@ -320,11 +320,11 @@ Each use case lists the primary actor, preconditions, main flow, alternate flows
 | ID | Rule |
 |----|------|
 | BR-01 | Only authenticated, verified users can upload, comment, like, or report. Guests have read-only access. |
-| BR-02 | A user can modify or delete only their own resources (videos, comments). Video owners may also delete comments on their videos. Operators are the only role that can hide a video. |
+| BR-02 | A user can modify or delete only their own videos. Comments cannot be edited or deleted by users. Operators are the only role that can hide a video or a comment. |
 | BR-03 | A video appears in the catalog, search, and playback for non-owners only when its status is `READY`. |
 | BR-04 | A user can like a given video at most once. |
 | BR-05 | The pipeline never deletes or overwrites raw uploads. User deletion removes the video from the product (soft delete). |
-| BR-06 | All media is delivered through signed URLs. Buckets are never public. |
+| BR-06 | Video media (playlists and segments) is delivered only through CloudFront signed cookies. Thumbnails are delivered through CloudFront without signing. Buckets are never public. |
 | BR-07 | Like, view, and comment counters are eventually consistent, and a periodic reconciliation job corrects drift against source-of-truth rows. |
 | BR-08 | Requests are rate-limited per user and per IP (values in the NFR document). |
 | BR-09 | Hidden or deleted content stays hidden even if its permalink is shared. |
@@ -343,11 +343,11 @@ These are configuration values, not hard-coded. The demo environment may set str
 | Max file size | 1 GB | Bounds storage and upload time |
 | Max source resolution | 1080p | Bounds transcode cost |
 | Accepted formats | MP4, MOV, WebM | Common, supported by ffmpeg |
-| Uploads per user per day | 5 | Abuse and cost control (R10) |
+| Uploads per user per day (UTC calendar day) | 5 | Abuse and cost control (R10) |
 | Title length | 1–100 characters | UI and indexing |
 | Description length | 0–5,000 characters | |
 | Comment length | 1–1,000 characters | |
 | Page size | default 20, max 50 | Protects the read path |
 | Presigned upload URL lifetime | 15 minutes | Limits leaked-URL exposure |
-| Signed playback URL lifetime | 2 hours | Longer than the longest video |
+| Signed playback access lifetime | 2 hours | Longer than the longest video |
 | Pending-upload expiry | 24 hours | Cleanup |

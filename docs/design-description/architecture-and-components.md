@@ -5,7 +5,7 @@ Related: [Overview](./overview.md) · [Data Design](./data-design.md) · [Interf
 
 **Conventions**
 - The **baseline** is README §3 and [`diagrams/architecture.png`](../diagrams/architecture.png). The README already describes each component (§3.2), the HA behavior (§3.3), and the stack (§6.3). This document does not repeat them. It adds the decisions the baseline leaves open.
-- Items marked *Proposed* are listed in §5 and need a team decision before the Design gate.
+- Findings from the design review, and how each was resolved, are in §5.
 
 ---
 
@@ -20,9 +20,9 @@ Related: [Overview](./overview.md) · [Data Design](./data-design.md) · [Interf
 | **Microservices on Fargate** | Independent scaling signals per service, no instance management. The cost is more moving parts, contained by the contract-first approach and CI/CD. |
 
 **Rules that follow from the pattern**
-1. **Synchronous path:** client → API Gateway → VPC Link → internal ALB → service. Services do not call each other synchronously on the read path, so one outage does not cascade (REL-12).
-2. **Asynchronous path:** S3 `ObjectCreated` → SQS → Transcoder → SNS `video-events` → status queue → Catalog. All consumers are idempotent (REL-14).
-3. **Single writer per table.** One Aurora cluster, one schema per service. A service writes only its own schema; others read it through documented read-only views (Data Design). *Proposed*, F4.
+1. **Synchronous path:** client → CloudFront (WAF) → API Gateway → VPC Link → internal ALB → service. Services do not call each other synchronously, so one outage does not cascade (REL-12).
+2. **Asynchronous path:** S3 `ObjectCreated` → SQS `transcode-queue` → Transcoder → SNS `video-events` → SQS `video-status-queue` → Catalog. All consumers are idempotent (REL-14).
+3. **Single writer per table.** One Aurora cluster, one schema per service. A service writes only its own schema; others read it through read-only views (Data Design §1.1).
 4. **The client composes.** Video detail (Catalog) and counts or comments (Interactions) are separate calls, so browsing and playback survive an Interactions outage.
 
 ---
@@ -31,19 +31,33 @@ Related: [Overview](./overview.md) · [Data Design](./data-design.md) · [Interf
 
 ![MyCilinder high-availability AWS architecture](../diagrams/architecture.png)
 
-*Figure 1: target architecture. The demo runs a throttled subset. C4 diagrams will be added under `docs/diagrams/` `[TBC]`.*
+*Figure 1: target architecture. The demo runs a throttled subset. Since the design review (§5, F1), the API is also served through CloudFront under `/api/*`.*
+
+> **C4 Level 1: System Context diagram goes here.**
+> Actors: Guest, Registered User / Creator, Platform Operator. External systems: Amazon Cognito, Cognito email, Vercel (optional web hosting).
+
+> **C4 Level 2: Container diagram goes here.**
+> Containers: Flutter client, CloudFront + WAF, API Gateway, internal ALB, the five services, Aurora, Redis, S3 `raw-videos` and `hls-output`, SQS `transcode-queue` and `video-status-queue`, SNS `video-events`.
+
+> **C4 Level 3: Component diagrams go here** (one per service, using the components in §4.2).
 
 ### 2.1 Request routing
 
-The ALB routes by path prefix. The final paths are defined in [`openapi.yaml`](../openapi.yaml). Where one resource spans services (such as `/videos/{id}/comments`), ALB rules use wildcard patterns with explicit priorities.
+A single CloudFront distribution on its default `*.cloudfront.net` domain is the only public entry point. WAF is attached to it.
 
-| Path (indicative) | Service | Auth |
-|-------------------|---------|------|
-| `/auth/*` | Auth facade | Public |
-| `/uploads/*` | Upload / Ingest | JWT |
-| `/videos/*/comments*`, `/videos/*/likes*`, `/videos/*/views*`, `/reports*` | Interactions | Reads public, writes JWT |
-| `/videos/*`, `/feed/*`, `/search`, `/creators/*`, `/me/videos*` | Catalog | Reads public, own videos JWT |
-| `/ops/*` | Catalog (hide / restore, report review) | JWT plus operator group claim |
+| CloudFront path | Origin |
+|-----------------|--------|
+| `/api/*` | API Gateway HTTP API, then VPC Link to the internal ALB |
+| `/videos/*`, `/thumbnails/*` | S3 `hls-output` through OAC (Data Design §3.1) |
+
+The ALB routes by path. Paths keep the `/api/v1` prefix end to end; it is omitted below. The endpoint list is in the Interface Design §1.2.
+
+| ALB rule (priority order) | Service |
+|---------------------------|---------|
+| `/auth/*`, `/me` | Auth facade |
+| `/uploads`, `/uploads/*` | Upload / Ingest |
+| `/videos/*/stats`, `/videos/*/comments`, `/videos/*/like`, `/videos/*/views`, `/reports`, `/ops/reports*`, `/ops/comments/*` | Interactions |
+| `/feed`, `/search`, `/creators/*`, `/videos/*`, `/me/videos`, `/ops/videos/*` | Catalog |
 
 ### 2.2 Key flows
 
@@ -61,17 +75,17 @@ sequenceDiagram
   participant H as S3 hls-output
   participant E as SNS video-events
   participant K as Catalog
-  C->>U: POST /uploads (title, size, type) + JWT
+  C->>U: POST /uploads + JWT + Idempotency-Key
   U->>DB: check quota, insert video (PENDING_UPLOAD)
-  U-->>C: videoId + presigned PUT URL
-  C->>S3: PUT file (direct, API never sees bytes)
+  U-->>C: videoId + presigned PUT or multipart URLs
+  C->>S3: upload file (direct, API never sees bytes)
   S3->>Q: ObjectCreated (key raw/{videoId}/source)
   Q->>T: job
   T->>E: video.processing
   T->>S3: read source, ffprobe
   T->>H: HLS 360p/720p + thumbnail, master.m3u8 last
   T->>E: video.ready (duration, renditions)
-  E->>K: status event (via SQS)
+  E->>K: event via SQS video-status-queue
   K->>DB: status = READY
 ```
 
@@ -88,41 +102,64 @@ sequenceDiagram
   C->>K: GET /videos/{id}
   K-->>C: metadata (404 if not READY and not owner)
   C->>K: GET /videos/{id}/playback
-  K-->>C: master playlist URL + signed access for videos/{id}/* (2 h)
-  C->>CF: master.m3u8, then segments
+  K-->>C: master playlist URL + signed cookies for /videos/{id}/* (2 h)
+  C->>CF: master.m3u8, then segments (with cookies)
   CF->>H: only on cache miss (OAC)
   C->>I: POST /videos/{id}/views (deduplicated)
 ```
 
-All API calls also pass through API Gateway, the VPC Link, and the ALB (omitted for readability).
+API calls to Catalog and Interactions also pass through CloudFront, API Gateway, the VPC Link, and the ALB (omitted for readability).
 
 ### 2.3 Video state ownership
 
 Each lifecycle transition (Functional Requirements §1.0) has exactly one actor. Catalog accepts a transition only if it moves forward, so duplicate or out-of-order events are ignored.
 
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING_UPLOAD: POST /uploads (Upload)
+  PENDING_UPLOAD --> PROCESSING: video.processing
+  PENDING_UPLOAD --> EXPIRED: older than 24 h
+  PROCESSING --> READY: video.ready
+  PROCESSING --> FAILED: video.failed or stuck-state sweep
+  READY --> HIDDEN: operator hide
+  HIDDEN --> READY: operator restore
+  READY --> DELETED: owner delete
+  HIDDEN --> DELETED: owner delete
+  FAILED --> DELETED: owner delete
+  DELETED --> [*]
+  EXPIRED --> [*]
+```
+
 | Transition | Actor | Trigger |
 |------------|-------|---------|
-| (none) → `PENDING_UPLOAD` | Upload / Ingest | `POST /uploads` accepted |
-| `PENDING_UPLOAD` → `PROCESSING` | Catalog | `video.processing` event (see F4 about `UPLOADED`) |
+| (none) → `PENDING_UPLOAD` | Upload / Ingest | `POST /uploads` accepted. The only write Upload makes to `videos`. |
+| `PENDING_UPLOAD` → `PROCESSING` | Catalog | `video.processing` event. `UPLOADED` is transient and not stored (FR-UP-06). |
 | `PROCESSING` → `READY` / `FAILED` | Catalog | `video.ready` / `video.failed` event |
-| `PENDING_UPLOAD` → expired | Catalog job | Older than 24 h (FR-UP-08) |
-| `READY` ↔ `HIDDEN` | Catalog | Operator call on `/ops/*` |
-| `READY` → `DELETED` | Catalog | Owner call (soft delete, BR-05) |
+| `PROCESSING` → `FAILED` | Catalog job | Still `PROCESSING` after 2 hours (F5) |
+| `PENDING_UPLOAD` → `EXPIRED` | Catalog job | Older than 24 hours (FR-UP-08) |
+| `READY` ↔ `HIDDEN` | Catalog | Operator call on `/ops/videos/*` |
+| `READY`, `HIDDEN`, `FAILED` → `DELETED` | Catalog | Owner call (soft delete, BR-05) |
 
 ---
 
 ## 3. Technology Stack
 
-Platform choices are in README §6.3, with two decisions settled in the [Overview](./overview.md) §2.5: region `us-east-1` and ffmpeg on Fargate Spot. The charter fixes only the languages (C-04), so the libraries below are *Proposed* defaults `[TBC]`.
+Platform choices are in README §6.3. Region `us-east-1` and ffmpeg on Fargate Spot are settled in the [Overview](./overview.md) §2.5. The libraries per language are:
 
-| Area | Go services (Auth, Catalog, Interactions) | Python services (Upload/Ingest, Transcoder) |
-|------|-------------------------------------------|---------------------------------------------|
-| HTTP | `net/http` with `chi` | FastAPI (Upload). The Transcoder has no HTTP API. |
-| PostgreSQL / Redis | `pgx` / `go-redis` | `psycopg` (v3) / not used |
+| Purpose | Go services (Auth, Catalog, Interactions) | Python services (Upload / Ingest, Transcoder) |
+|---------|-------------------------------------------|-----------------------------------------------|
+| HTTP server and routing | `net/http` with `go-chi/chi` | FastAPI on `uvicorn` (Upload only; the Transcoder has no HTTP API) |
+| PostgreSQL | `jackc/pgx` (with `pgxpool`) | `psycopg` 3 with `psycopg_pool` (Upload only) |
+| Redis | `redis/go-redis` | not used |
 | AWS | AWS SDK for Go v2 | `boto3` |
-| Logging, tracing | `log/slog` (JSON), OpenTelemetry to X-Ray | `structlog` or `logging` (JSON), OpenTelemetry to X-Ray |
-| Lint, tests (MAINT-10) | `gofmt`, `golangci-lint`, `go test` | `ruff`, `black`, type checking, `pytest` |
-| Media | not used | `ffmpeg` / `ffprobe` as subprocesses (bundled in the worker image) |
+| JWT validation (Cognito JWKS) | `lestrrat-go/jwx` | `PyJWT` with its JWKS client |
+| Logging | `log/slog` with the JSON handler | `structlog` with JSON output |
+| Tracing | OpenTelemetry Go SDK with `otelhttp`, exported to X-Ray through the collector sidecar | OpenTelemetry Python SDK with FastAPI and botocore instrumentation, same exporter |
+| Retries and circuit breaker | `cenkalti/backoff` and `sony/gobreaker` | `tenacity` and `pybreaker` |
+| Schema migrations | `golang-migrate` (plain SQL files, also used for the `upload` schema) | `golang-migrate` |
+| Lint and format (MAINT-10) | `gofmt`, `golangci-lint` | `ruff`, `black`, `mypy` |
+| Tests | `go test` | `pytest` |
+| Media | not used | `ffmpeg` / `ffprobe` as subprocesses, bundled in the worker image |
 
 API contracts are validated against `openapi.yaml` in CI (MAINT-01).
 
@@ -137,36 +174,39 @@ Responsibilities per service are in README §3.2 and the FR areas below. This ta
 | Service | Lang | Owns | FR area | Reads (read-only views) |
 |---------|------|------|---------|-------------------------|
 | **Auth facade** | Go | `users` (profile keyed by Cognito `sub`) | FR-AUTH | none |
-| **Catalog / Metadata** | Go | `videos` | FR-PB, FR-BR, FR-CR, FR-MOD-04 | `users`, `video_stats` |
-| **Interactions** | Go | `comments`, `likes`, `video_stats`, `reports` | FR-IN, FR-MOD-01..03 | `videos` (existence, visibility) |
-| **Upload / Ingest** | Python | `upload_requests` (quota, idempotency keys); inserts the initial `videos` row | FR-UP | none |
+| **Catalog / Metadata** | Go | `videos`, except the initial insert | FR-PB (except views), FR-BR, FR-CR, FR-MOD-04 (videos) | `users`, `video_stats` |
+| **Interactions** | Go | `comments`, `likes`, `video_stats`, `reports` | FR-IN, FR-PB-04, FR-MOD-01..03, FR-MOD-04 (comments) | `videos` (existence, visibility) |
+| **Upload / Ingest** | Python | `upload_requests`, `daily_quota`; inserts the initial `videos` row | FR-UP | none |
 | **Transcoder** | Python + ffmpeg | nothing; no database access | FR-TR | S3, SQS |
 
 ### 4.2 Design detail per service
 
-**Auth facade.** Public routes (register, login, refresh, password reset) bypass the API Gateway JWT authorizer and are throttled (SEC-09). The profile row is created on first login (FR-AUTH-05).
+**Auth facade.** Public routes (register, confirm, login, refresh) bypass the API Gateway JWT authorizer and are throttled (SEC-09). The profile row is created on first login (FR-AUTH-05). Cognito details are in the Interface Design §3.1.
 
 **Catalog.**
-- *Feeds and search:* cache-aside in Redis with short TTLs and single-flight against stampedes; falls back to the Aurora reader when Redis is down.
-- *Playback access:* checks visibility (`HIDDEN`, `DELETED`, unknown return 404 to non-owners), then returns the master playlist URL and CloudFront access scoped to `videos/{videoId}/*`, valid 2 hours. The signing key is in Secrets Manager.
-- *Status consumer:* long-polls the status queue and applies the forward-only state machine (§2.3).
-- *Background jobs:* pending-upload expiry and a stuck-state sweep. They run in every task under a PostgreSQL advisory lock, so only one instance works at a time and no scheduler is needed (*Proposed*, F7).
+- *Feeds and search:* cache-aside in Redis (TTLs in Data Design §3.2) with single-flight against stampedes; falls back to the Aurora reader when Redis is down.
+- *Playback access:* checks visibility (`HIDDEN`, `DELETED`, unknown return 404 to non-owners), then returns signed cookies scoped to `/videos/{videoId}/*`, valid 2 hours (Interface Design §1.3). The signing key is in Secrets Manager.
+- *Status consumer:* long-polls `video-status-queue` and applies the forward-only state machine (§2.3).
+- *Background jobs:* pending-upload expiry (every 15 minutes), the stuck-state sweep (every 15 minutes), and removal of HLS outputs 7 days after deletion (daily).
 
 **Interactions.**
-- *Likes:* the `likes` row is the source of truth; `INSERT … ON CONFLICT DO NOTHING` on `(user, video)` makes it idempotent, and the Redis counter changes only if a row was inserted.
-- *Views:* Redis `SET NX EX 1800` on `(viewer, video)` implements BR-VIEW; guests use an anonymous session id.
-- *Counters:* increments go to Redis plus a dirty set; a flusher batches deltas into `video_stats`; a reconciler recomputes like and comment counts from source rows (BR-07). Views have no source rows, so a lost flush costs at most one interval of views.
+- *Likes:* the `likes` row is the source of truth; `INSERT … ON CONFLICT DO NOTHING` on `(video, user)` makes it idempotent, and the Redis counter changes only if a row was inserted or deleted.
+- *Views:* Redis `SET NX EX 1800` on `(video, viewer)` implements BR-VIEW; guests use the `X-Session-Id` value.
+- *Counters:* increments go to Redis plus a dirty set. Background jobs flush deltas into `video_stats` every 5 seconds and reconcile like and comment counts from source rows every hour (BR-07, Data Design §3.2).
+- *Moderation:* stores reports, serves the operator queue, and hides reported comments.
 
 **Upload / Ingest.**
-- The presigned PUT signs `Content-Type` and `Content-Length` for one key `raw/{videoId}/source`, expires in 15 minutes, and the declared size is checked against the 1 GB cap. Multipart uses one URL per part, and a bucket lifecycle rule aborts incomplete uploads.
+- Files up to 100 MB get one presigned PUT that signs `Content-Type` and `Content-Length` for the key `raw/{videoId}/source`. Larger files use multipart with one presigned URL per 64 MB part. All URLs expire in 15 minutes, and the declared size is checked against the 1 GB cap. A bucket lifecycle rule aborts incomplete multipart uploads after 1 day.
 - The declared metadata is not trusted: the worker re-verifies the real file (FR-UP-07, SEC-08).
 
 **Transcoder.**
-- *Polling:* derives `videoId` from the object key and extends the message visibility every minute while working, instead of one very long timeout.
+- *Polling:* derives `videoId` from the object key. The queue's visibility timeout is 5 minutes, and the worker extends it every minute while working, so a crashed worker's message reappears within 5 minutes.
 - *Idempotency:* the master playlist is written **last** and acts as the commit marker. If it already exists, the worker re-publishes `video.ready` and deletes the message.
-- *Events:* `video.processing`, `video.ready` (duration, renditions, thumbnail key), `video.failed` (reason). On the last allowed receive (the 3rd, FR-TR-06) a handled failure emits `video.failed` before the message reaches the DLQ.
-- *Spot:* on `SIGTERM` the worker stops and leaves the message untouched so it becomes visible again; the task `stopTimeout` is set to the maximum.
+- *Events:* `video.processing`, `video.ready`, `video.failed` (Interface Design §2.1). On the last allowed receive (the 3rd, FR-TR-06) a handled failure emits `video.failed` before the message reaches the DLQ.
+- *Spot:* on `SIGTERM` the worker stops and leaves the message untouched so it becomes visible again; the task `stopTimeout` is set to the maximum (120 seconds).
 - *Isolation:* ffmpeg runs as a non-root user with a read-only root filesystem and no database credentials.
+
+**Background jobs (F7).** Periodic work runs as loops inside the owning service. Every task runs the loop, but each run first takes a PostgreSQL advisory lock (`pg_try_advisory_lock`), so only one task does the work at a time and no scheduler component is needed.
 
 ### 4.3 Sizing
 
@@ -174,32 +214,55 @@ Responsibilities per service are in README §3.2 and the FR areas below. This ta
 |---------|-----------|--------|------|
 | Auth, Catalog, Interactions | ≤ 0.5 vCPU / 1 GB (PERF-09) | ≥ 2 each; about 10 API tasks at 1M DAU (NFR §5.7) | 1 each |
 | Upload / Ingest | 0.5 vCPU / 1 GB | 2 to 4 | 1 |
-| Transcoder | 2 vCPU / 4 GB; ephemeral storage for a 1 GB source plus output | 0 to about 105 at 1M DAU peak (NFR §5.5); scales on queue backlog per task, with an alarm-based step from 0 to 1 | 0 to 2 |
+| Transcoder | 2 vCPU / 4 GB; 30 GB ephemeral storage for a 1 GB source plus output | 0 to about 105 at 1M DAU peak (NFR §5.5); scales on queue backlog per task, with an alarm-based step from 0 to 1 | 0 to 2 |
 
-### 4.4 Least-privilege task roles (SEC-06)
+### 4.4 Security boundaries (SEC-06)
 
-| Service | Allowed |
-|---------|---------|
-| Auth facade | Cognito user-pool operations used by the facade; its database secret |
-| Catalog | Receive / delete on the status queue; CloudFront signing key; its database secret |
-| Interactions | Its database secret |
-| Upload / Ingest | `PutObject` and multipart actions on `raw-videos`; its database secret |
-| Transcoder | `GetObject` on `raw-videos`; `PutObject` on `hls-output`; receive, delete, change visibility on `transcode-queue`; publish to `video-events`. No database. |
+| Service | Task role allows |
+|---------|------------------|
+| Auth facade | Its secrets. The Cognito operations it uses are authorized by the app client secret and user tokens, not IAM. |
+| Catalog | Receive and delete on `video-status-queue`; `ListBucket` and `DeleteObject` on `hls-output` (cleanup); its secrets, including the CloudFront signing key |
+| Interactions | Its secrets |
+| Upload / Ingest | `PutObject` and multipart actions on `raw-videos`; its secrets |
+| Transcoder | `GetObject` on `raw-videos`; `PutObject` on `hls-output`; receive, delete, and change visibility on `transcode-queue`; publish to `video-events`. No database. |
 
-Each service also uses its own PostgreSQL role with grants only on its own schema plus the read-only views. Security groups chain VPC Link → ALB → services → Aurora and Redis, with no other ingress. Shared libraries per language cover JWT validation, structured logging with a correlation id, config from environment variables, retries with backoff, a circuit breaker, and `/healthz` and `/readyz` (the repository layout is decided in Implementation `[TBC]`). Security, reliability, and observability requirements are in NFR §2–§4.
+All tasks may also write traces to X-Ray through the collector sidecar. Each service uses its own PostgreSQL role with grants only on its own schema plus the read-only views (Data Design §1.1). Security groups chain VPC Link → ALB → services → Aurora and Redis, with no other ingress.
+
+### 4.5 Repository layout
+
+This repository is a monorepo for all backend services. Each service builds its own image and deploys independently (MAINT-09).
+
+```
+MyCilinder-Backend/
+├── services/
+│   ├── auth/            # Go
+│   ├── catalog/         # Go
+│   ├── interactions/    # Go
+│   ├── upload/          # Python
+│   └── transcoder/      # Python + ffmpeg
+├── libs/
+│   ├── go/              # shared Go module
+│   └── python/          # shared Python package
+├── migrations/          # one folder per schema: auth, catalog, interactions, upload, audit
+├── deploy/local/        # Docker Compose for local development
+├── .github/workflows/   # one pipeline per service, triggered by path
+└── docs/
+```
+
+Each service folder contains its code, `Dockerfile`, tests, and README (MAINT-07). The shared libraries cover JWT validation, origin-header verification, structured logging with a correlation id, configuration from environment variables, retries with backoff, the circuit breaker, per-user rate limiting, and `/healthz` and `/readyz`.
 
 ---
 
 ## 5. Design Review Findings
 
-Issues found while turning the baseline into a design. Each needs a team decision. Until then the text above follows the baseline and the *Proposed* items.
+Issues found while turning the baseline into a design. All resolutions were accepted by the team and are reflected in the documents.
 
-| # | Finding | Proposed resolution |
-|---|---------|---------------------|
-| F1 | **WAF cannot be attached to an API Gateway *HTTP* API.** AWS WAF supports REST APIs, CloudFront, ALB, and others, but not HTTP APIs. The baseline says WAF protects API Gateway, so `/api` would have no WAF (weakens SEC-09, R7). | Put the API behind the same CloudFront distribution (`/api/*` to API Gateway, `/media/*` to S3) and attach WAF there, or switch to a REST API (higher cost). The first option also solves F2. |
-| F2 | **HLS authorization.** A signed URL for the master playlist does not authorize the segment URLs inside it. HLS needs CloudFront **signed cookies** scoped to `videos/{videoId}/*`, valid for the media domain. Flutter web needs real cookies on the same site; Android players may need cookies passed as headers. | Signed cookies, with API and media on one domain (F1). Validate on web and Android in the walking skeleton (R5). FR-PB-02 should say "signed access". |
-| F3 | **Per-user and per-IP rate limits (SEC-09).** An HTTP API throttles per route or stage, not per client. | Per-IP in WAF, per-user in Redis inside the services. |
-| F4 | **State ownership gaps.** (a) S3 sends `ObjectCreated` straight to the transcode queue, so nothing marks `UPLOADED` as FR-UP-06 expects. (b) Upload creates the video record while Catalog consumes status events, so two services write `videos`. (c) Reports, moderation, and profiles have no owning service in README §3.2. | (a) Treat `UPLOADED` as transient and reword FR-UP-06. (b) Upload only inserts; Catalog owns every later change, enforced with PostgreSQL grants. (c) Auth owns profiles, Interactions owns reports, Catalog owns hide / restore. |
-| F5 | **Jobs that crash never produce `FAILED`.** A message that reaches the DLQ after hard crashes or repeated Spot interruptions emits no event. | Worker emits `video.failed` on handled errors at the last attempt; Catalog's sweep marks long-running `PROCESSING` videos `FAILED` (retryable, FR-CR-05); a DLQ alarm lets an operator re-drive. |
-| F6 | **Fixed hourly costs dominate the credits.** Always-on: two NAT Gateways, ALB, Aurora, two Redis nodes, interface VPC endpoints, WAF, idle Fargate tasks. Traffic to SNS, Cognito, Secrets Manager, and X-Ray has no VPC endpoint in the diagram, so it goes through NAT. Free plan eligibility of several of these is unconfirmed (R1). | Demo: one NAT, single-node Redis, Aurora writer only, minimum tasks 1, and destroy or scale to zero the expensive layers between sessions. Estimate with the AWS Pricing Calculator before the Deployment gate. |
-| F7 | **No scheduler is drawn** for periodic work (expiry, stuck-state sweep, counter flush, reconciliation). | In-service loops under an advisory lock (no new component). EventBridge Scheduler is the alternative. |
+| # | Finding | Resolution |
+|---|---------|------------|
+| F1 | **WAF cannot be attached to an API Gateway *HTTP* API.** AWS WAF supports REST APIs, CloudFront, ALB, and others, but not HTTP APIs. | The API is served through the same CloudFront distribution as media (`/api/*`), and WAF is attached to the distribution. CloudFront adds a secret origin header that the services verify, so API Gateway's own endpoint cannot bypass WAF (Interface Design §3.2). |
+| F2 | **HLS authorization.** A signed URL for the master playlist does not authorize the segment URLs inside it. | CloudFront signed cookies scoped to `/videos/{videoId}/*`, on the same domain as the API (F1). The Android player passes them as a header (Interface Design §1.3). Validated in the walking skeleton (R5). |
+| F3 | **Per-user and per-IP rate limits (SEC-09).** An HTTP API throttles per route or stage, not per client. | Per IP: a WAF rate-based rule. Per user: a Redis counter in the shared library. API Gateway stage throttling remains as a global ceiling. |
+| F4 | **State ownership gaps.** (a) Nothing marks `UPLOADED`. (b) Two services wrote `videos`. (c) Reports, moderation, and profiles had no owning service. | (a) `UPLOADED` is transient (FR-UP-06). (b) Upload only inserts; Catalog owns every later change, enforced with PostgreSQL grants. (c) Auth owns profiles, Interactions owns reports and comment hiding, Catalog owns video hide and restore. |
+| F5 | **Jobs that crash never produce `FAILED`.** A message that reaches the DLQ after hard crashes or repeated Spot interruptions emits no event. | The worker emits `video.failed` on handled errors at the last attempt; Catalog's sweep marks videos still `PROCESSING` after 2 hours as `FAILED`; a DLQ alarm lets an operator re-drive the message. |
+| F6 | **Fixed hourly costs dominate the credits.** Always-on: NAT Gateways, ALB, Aurora, Redis nodes, interface VPC endpoints, WAF, idle Fargate tasks. SNS, Cognito, Secrets Manager, and X-Ray traffic goes through NAT. | Demo: one NAT, single-node Redis, Aurora writer only, minimum tasks 1, and destroy or scale to zero the expensive layers between sessions. Costs are estimated with the AWS Pricing Calculator before the Deployment gate. |
+| F7 | **No scheduler** for periodic work (expiry, stuck-state sweep, output cleanup, counter flush, reconciliation). | In-service loops under a PostgreSQL advisory lock (§4.2). No new component. |

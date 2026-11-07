@@ -37,11 +37,11 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 
 | ID | Requirement | Charter |
 |----|-------------|---------|
-| SEC-01 | **Authentication:** all mutating endpoints and user-specific reads require a valid Cognito-issued JWT. Tokens are validated at the edge (API Gateway/ALB) **and** re-checked by each service (signature, expiry, audience). | NFR6 |
+| SEC-01 | **Authentication:** all mutating endpoints and user-specific reads require a valid Cognito-issued JWT. Tokens are validated at the edge (API Gateway) **and** re-checked by each service (signature, expiry, audience). | NFR6 |
 | SEC-02 | **Authorization:** services enforce ownership checks (BR-02) server-side. Client-supplied user IDs are never trusted; identity comes from the token. | NFR6 |
 | SEC-03 | **Transport:** TLS 1.2 or higher on all external traffic. HTTP is redirected or refused. | NFR6 |
 | SEC-04 | **Encryption at rest:** S3 buckets, Aurora, and Redis use encryption at rest (provider-managed keys are acceptable for the MVP). | NFR6 |
-| SEC-05 | **No public buckets:** S3 Block Public Access is on for all buckets. Uploads use short-lived presigned URLs scoped to one object key and size limit. Playback uses signed CloudFront URLs or cookies. Buckets are reachable by CloudFront only through origin access control. | NFR6, R7 |
+| SEC-05 | **No public buckets:** S3 Block Public Access is on for all buckets. Uploads use short-lived presigned URLs scoped to one object key and size limit. Video playback uses signed CloudFront cookies; thumbnails are served through CloudFront without signing (BR-06). Buckets are reachable by CloudFront only through origin access control. | NFR6, R7 |
 | SEC-06 | **Least privilege IAM:** each service has its own task role granting only the actions and resources it needs. No wildcard administrator roles at runtime. | NFR6, R7 |
 | SEC-07 | **Input validation:** all inputs are validated for type, length, and format. SQL access uses parameterized queries only. Comment and description text is stored raw and escaped on output by clients. | NFR6 |
 | SEC-08 | **Untrusted media:** uploaded files are probed with `ffprobe` in an isolated worker (no network access beyond S3/SQS where feasible) before transcoding. File type is determined from content, not from the file name or declared MIME type. | NFR6 |
@@ -51,7 +51,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | SEC-12 | **Privacy:** collect only email and display name. Do not log tokens, passwords, or full email addresses. Logs avoid personal data beyond opaque user IDs. | NFR6, C-12 |
 | SEC-13 | **CORS:** only the known web origin(s) (Vercel domain, local dev) are allowed. | NFR6 |
 | SEC-14 | **Supply chain and IaC scanning in CI:** dependency vulnerability scanning for Go and Python, container image scanning, and `tfsec`/checkov on Terraform. Critical findings block merge. | NFR6, R7 |
-| SEC-15 | **Audit trail:** moderation actions (hide/restore) and authentication events are logged with actor, target, and time. | NFR6, NFR7 |
+| SEC-15 | **Audit trail:** moderation actions (hide/restore, report resolution) and authentication events are recorded with actor, target, and time in an append-only audit table and in the logs. | NFR6, NFR7 |
 | SEC-16 | **Cost abuse protection:** budget alarms at 50/75/90% of credits, and upload quotas, so abuse cannot burn the budget unnoticed. | NFR5, R1, R10 |
 
 ### 2.2 Access control matrix
@@ -64,7 +64,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | Own non-ready videos | — | — | R | R |
 | Upload / create video | — | C | C | — |
 | Edit / delete video | — | — | U, D (own) | hide/restore any |
-| Comments | R | C, D (own) | C, D (own and on own videos) | D (any) |
+| Comments | R | C | C | hide (any) |
 | Likes | R (counts) | C, D (own) | C, D (own) | — |
 | Reports | — | C | C | R, U (resolve) |
 | Own profile | — | R, U (own) | R, U (own) | — |
@@ -126,7 +126,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | MAINT-01 | **Contract first:** `docs/openapi.yaml` is the single source of truth. Services and the Flutter client are validated against it in CI. | R4, R5 |
 | MAINT-02 | **Uniform packaging:** every service is a container built from a Dockerfile, with configuration only through environment variables (12-factor). | R4 |
 | MAINT-03 | **CI/CD per service:** each push runs lint, unit tests, and build. Merges to main publish an image to ECR. Infrastructure changes are applied only after `terraform plan` review. | NFR7 |
-| MAINT-04 | **Test coverage:** ≥ 70% line coverage on business logic in each service `[TBC]`. | |
+| MAINT-04 | **Test coverage:** ≥ 70% line coverage on business logic in each service. | |
 | MAINT-05 | **Observability:** structured JSON logs with a correlation ID propagated across services, metrics for request rate/errors/latency (RED), queue depth, and business counters (uploads, transcodes, failures). Alarms on error rate, p95 latency, DLQ depth, and budget. | NFR7 |
 | MAINT-06 | **Tracing** of the upload to READY path with X-Ray or equivalent. | NFR7 |
 | MAINT-07 | **Documentation:** each service has a README (purpose, run, test, config). Significant design choices are recorded as short decision records in the design description. | |
@@ -138,7 +138,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 
 ## 5. Back-of-the-Envelope Calculations
 
-Purpose: show that the architecture is sized with reasoning, identify which resources dominate, and justify the design choices and the demo scale. These are order-of-magnitude estimates. **Every input below is an assumption (`[TBC]`)** and changing one changes the output. Costs are intentionally not computed here: use the AWS Pricing Calculator once the region and services are fixed in Design.
+Purpose: show that the architecture is sized with reasoning, identify which resources dominate, and justify the design choices and the demo scale. These are order-of-magnitude estimates. **Every input below is an accepted sizing assumption**, to be checked in the Testing phase, and changing one changes the output. Costs are intentionally not computed here: they are estimated with the AWS Pricing Calculator before the Deployment gate (Architecture and Components §5, F6).
 
 ### 5.1 Assumptions
 
@@ -216,11 +216,11 @@ Transcoding is **bursty and queue-buffered**. Workers can be provisioned below p
 
 ### 5.7 Service sizing (compute)
 
-Assuming one Go API task handles ≈ 500 requests/s `[to be verified by load test]`:
+Assuming one Go API task handles ≈ 500 requests/s (checked by the load test in the Testing phase):
 - 1M DAU peak 2,100 req/s ÷ 500 ≈ 5 tasks at full utilization.
 - At 50% target utilization for headroom (SCAL-08), and spread across 2 AZs, about **10 API tasks in total** across Catalog, Interactions, and Auth.
 
-### 5.8 Demo-scale sizing (proposed)
+### 5.8 Demo-scale sizing
 
 | Item | Demo target |
 |------|---------------------|
@@ -236,5 +236,5 @@ Assuming one Go API task handles ≈ 500 requests/s `[to be verified by load tes
 1. **Egress dominates everything.** At 1M DAU the platform serves about 225 TB per day, versus roughly 100 GB per year of relational data. CDN delivery, bitrate ladder, and cache hit ratio are the design levers that matter most. This is also why the credits cannot sustain real load (R1) and why the demo is throttled.
 2. **The API and database are comparatively small** (≈ 2,100 peak requests/s, ≈ 255 writes/s). The right investment is statelessness, caching, and multi-AZ rather than exotic data stores.
 3. **Transcoding is the other cost driver** and the one best handled with a queue and capped inputs (R2).
-4. **Storage grows about 1.5 PB per year at the top of the range.** Lifecycle rules on `raw` (e.g. transition to a cheaper storage class) become relevant at scale. They are left as Design work, and BR-05 retention must be settled first.
+4. **Storage grows about 1.5 PB per year at the top of the range.** Lifecycle rules on `raw` become relevant at scale: the design moves raw uploads to S3 Glacier Flexible Retrieval after 30 days, without deleting them (BR-05, Data Design §3.3).
 5. **Demo scale is roughly four orders of magnitude below 1M DAU in egress.** The test plan must therefore validate the design by combining small-scale load tests with calculation, and say so explicitly.

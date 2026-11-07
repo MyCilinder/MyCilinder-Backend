@@ -13,14 +13,14 @@ MyCilinder is a video-on-demand (VOD) platform. Users upload videos, the system 
 
 | # | Function | Summary | Detailed in |
 |---|----------|---------|-------------|
-| PF1 | **Accounts & authentication** | Register, verify email, log in/out, reset password, manage display name. Identity is managed by AWS Cognito behind an `/auth` facade. | FR-AUTH |
+| PF1 | **Accounts & authentication** | Register, verify email, log in/out, manage display name. Identity is managed by AWS Cognito behind an `/auth` facade. | FR-AUTH |
 | PF2 | **Video upload** | Authenticated users upload a video directly to object storage, with title and description. Limits on size, duration, and resolution apply. | FR-UP |
 | PF3 | **Transcoding** | Uploaded videos are validated and converted asynchronously to HLS (360p / 720p) plus a thumbnail. | FR-TR |
 | PF4 | **Playback** | Watch a video with adaptive bitrate through the CDN; share it via a permalink; views are counted. | FR-PB |
 | PF5 | **Browse & search** | Recent and most-viewed feeds, keyword search, and creator pages. | FR-BR |
 | PF6 | **Interactions** | Comments, likes, and view/like/comment counters. | FR-IN |
 | PF7 | **Creator studio** | See my uploads and their processing status; edit or delete them. | FR-CR |
-| PF8 | **Reporting hooks** | Report a video or comment; operators can review reports and hide content. | FR-MOD |
+| PF8 | **Reporting hooks** | Report a video or comment; operators can review reports and hide videos or comments. | FR-MOD |
 
 ---
 
@@ -30,8 +30,8 @@ MyCilinder is a video-on-demand (VOD) platform. Users upload videos, the system 
 |-------|-------------|-----------------|-------------|----------|
 | **Guest** | Unauthenticated visitor, typically arriving via a shared link. | None assumed. | Browse, search, watch, read comments and counts. Cannot upload, comment, or like. | High |
 | **Registered User** | Authenticated account holder. Primary consumer of the platform. | Low to moderate; familiar with mainstream video apps. | Everything a Guest can do, plus comment, like, report, and manage own profile. | High |
-| **Creator** | A Registered User who uploads videos. Not a separate account type; the capability is available to every verified user. | Low to moderate. Expects upload progress and clear processing status. | Registered User permissions, plus upload, edit, and delete **own** videos and delete comments on own videos. | High |
-| **Platform Operator** | A member of the development team operating the system (AWS console, dashboards, scripts). | High. | Review reports, hide content, view metrics and logs. There is **no admin UI in the MVP**; operator actions are performed through restricted endpoints. | Medium |
+| **Creator** | A Registered User who uploads videos. Not a separate account type; the capability is available to every verified user. | Low to moderate. Expects upload progress and clear processing status. | Registered User permissions, plus upload, edit, and delete **own** videos. | High |
+| **Platform Operator** | A member of the development team operating the system (AWS console, dashboards, scripts). | High. | Review reports, hide videos and comments, view metrics and logs. There is **no admin UI in the MVP**; operator actions are performed through restricted endpoints. | Medium |
 
 Non-human actors that appear in use cases: the **Transcoder worker** (consumes queue jobs) and **Cognito** (identity provider).
 
@@ -42,14 +42,14 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 **Clients**
 - **Android:** Flutter app, sideloaded as an APK for the demo. Minimum Android version is defined by the Frontend repo (Flutter default floor).
 - **Web:** Latest two versions of Chrome, Edge, Firefox, and Safari. Hosted on Vercel (free tier) only if a web demo is needed.
-- **HLS note:** Safari plays HLS natively. Other browsers need an MSE-based HLS player (e.g. hls.js-style). Flutter-web HLS playback must be validated early in Design (see R5, walking skeleton).
+- **HLS note:** Safari plays HLS natively. Other browsers need an MSE-based HLS player (e.g. hls.js-style). Flutter-web HLS playback with signed cookies must be validated early, in the walking skeleton (R5).
 - **Network:** HTTPS only. Clients must tolerate mobile-grade bandwidth; adaptive bitrate handles variation.
 
 **Server side**
-- **Cloud:** AWS, single region. The region is chosen in Design (service availability, price, and latency to the user base).
+- **Cloud:** AWS, single region: `us-east-1` (Design Overview §2.5, P1).
 - **Compute:** Linux containers on ECS Fargate, built per service and stored in ECR.
 - **Runtimes:** Go (Catalog, Interactions, Auth facade) and Python (Upload/Ingest, Transcoder worker). See README §6.
-- **Data:** Aurora PostgreSQL, ElastiCache Redis, S3 (`raw` and `output` buckets), SQS, CloudFront, Cognito.
+- **Data:** Aurora PostgreSQL Serverless v2, ElastiCache Redis, S3 (`raw` and `output` buckets), SQS, SNS, CloudFront, Cognito.
 - **Provisioning & delivery:** Terraform (separate repo), GitHub Actions CI/CD.
 
 **Environments**
@@ -73,7 +73,7 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 | C-08 | **Media data path stays off application compute** (presigned S3 uploads, CloudFront delivery). | Architectural principle |
 | C-09 | MVP transcodes to **360p and 720p only**, with caps on input size, duration, and resolution. | Cost control (R1, R2) |
 | C-10 | Web frontend, if hosted, uses **Vercel free tier**; otherwise Android APK is sideloaded. | Team decision |
-| C-11 | No public write access to buckets; media is served only through signed URLs. | Security (R7) |
+| C-11 | No public write access to buckets; video media is served only through signed access (thumbnails through CloudFront without signing, BR-06). | Security (R7) |
 | C-12 | **Regulatory:** no formal compliance program (e.g. Mexican personal-data law LFPDPPP, copyright takedown) is in scope. The system limits risk by collecting minimal personal data and providing reporting hooks. Legal review is out of scope.  | Scope decision |
 
 ---
@@ -104,11 +104,11 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 | AWS Cognito | Identity and tokens | No login or registration. Already-issued tokens keep working until expiry. |
 | Amazon S3 | Raw and output media storage | No upload or playback origin. |
 | Amazon CloudFront | Media delivery | Playback degraded or down. |
-| Amazon SQS | Transcode job queue | New uploads queue up unprocessed. |
+| Amazon SQS / SNS | Transcode job queue, video status events | New uploads queue up unprocessed; finished videos stay in PROCESSING until events are delivered. |
 | Amazon ECS Fargate / ECR | Running services | Service outage. |
 | Amazon Aurora PostgreSQL | Metadata, comments, likes | Core read path down. |
 | ElastiCache Redis | Counters and hot cache | Degrades to DB reads (see NFR REL). |
-| Ffmpeg on Fargate | Transcoding (decided in Design) | Videos stay in PROCESSING. |
+| ffmpeg on Fargate Spot | Transcoding | Videos stay in PROCESSING. |
 | Vercel (optional) | Web client hosting | Web demo unavailable. Android demo is the fallback. |
 | GitHub Actions | CI/CD | Builds and deploys blocked. Manual deploy is the fallback. |
 
@@ -117,4 +117,4 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 - The Frontend depends on a stable `openapi.yaml` from this repo.
 
 **Platform constraints to watch**
-- New or educational AWS accounts often have **low default service quotas** (e.g. Fargate vCPU, concurrent tasks). These can block scale-up demonstrations. Check quotas in Design.
+- New or educational AWS accounts often have **low default service quotas** (e.g. Fargate vCPU, concurrent tasks). These can block scale-up demonstrations, so quotas must be checked before any scale-up demonstration.
