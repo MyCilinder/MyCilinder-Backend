@@ -49,7 +49,7 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 - **Cloud:** AWS, single region: `us-east-1` (Design Overview §2.5, P1).
 - **Compute:** Linux containers on ECS Fargate, built per service and stored in ECR.
 - **Runtimes:** Go (Catalog, Interactions, Auth facade) and Python (Upload/Ingest, Transcoder worker). See README §6.
-- **Data:** Aurora PostgreSQL Serverless v2, ElastiCache Redis, S3 (`raw` and `output` buckets), SQS, SNS, CloudFront, Cognito.
+- **Data:** Aurora PostgreSQL Serverless v2 (reached through Amazon RDS Proxy), ElastiCache Redis, S3 (`raw` and `output` buckets), SQS, SNS, CloudFront, Cognito.
 - **Provisioning & delivery:** Terraform (separate repo), GitHub Actions CI/CD.
 
 **Environments**
@@ -107,6 +107,7 @@ Non-human actors that appear in use cases: the **Transcoder worker** (consumes q
 | Amazon SQS / SNS | Transcode job queue, video status events | New uploads queue up unprocessed; finished videos stay in PROCESSING until events are delivered. |
 | Amazon ECS Fargate / ECR | Running services | Service outage. |
 | Amazon Aurora PostgreSQL | Metadata, comments, likes | Core read path down. |
+| Amazon RDS Proxy | Connection pooling between services and Aurora | Services cannot reach the database: same impact as Aurora down. Multi-AZ by design. |
 | ElastiCache Redis | Counters and hot cache | Degrades to DB reads (see NFR REL). |
 | ffmpeg on Fargate Spot | Transcoding | Videos stay in PROCESSING. |
 | Vercel (optional) | Web client hosting | Web demo unavailable. Android demo is the fallback. |

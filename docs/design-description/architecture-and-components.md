@@ -3,10 +3,6 @@
 Part of the MyCilinder Software Design Description (SDD).
 Related: [Overview](./overview.md) · [Data Design](./data-design.md) · [Interface Design](./interface-design.md) · [Requirement Specification](../requirement-specification/overall-description.md) · [Project charter](../../README.md)
 
-**Conventions**
-- The **baseline** is README §3 and [`diagrams/architecture.png`](../diagrams/architecture.png). The README already describes each component (§3.2), the HA behavior (§3.3), and the stack (§6.3). This document does not repeat them. It adds the decisions the baseline leaves open.
-- Findings from the design review, and how each was resolved, are in §5.
-
 ---
 
 ## 1. Architectural Pattern
@@ -23,7 +19,8 @@ Related: [Overview](./overview.md) · [Data Design](./data-design.md) · [Interf
 1. **Synchronous path:** client → CloudFront (WAF) → API Gateway → VPC Link → internal ALB → service. Services do not call each other synchronously, so one outage does not cascade (REL-12).
 2. **Asynchronous path:** S3 `ObjectCreated` → SQS `transcode-queue` → Transcoder → SNS `video-events` → SQS `video-status-queue` → Catalog. All consumers are idempotent (REL-14).
 3. **Single writer per table.** One Aurora cluster, one schema per service. A service writes only its own schema; others read it through read-only views (Data Design §1.1).
-4. **The client composes.** Video detail (Catalog) and counts or comments (Interactions) are separate calls, so browsing and playback survive an Interactions outage.
+4. **Database access only through RDS Proxy.** No task connects to an Aurora endpoint directly. Fargate tasks are short-lived and their number changes with load, so the proxy holds the connection pool to Aurora and the tasks hold only small pools to the proxy (§4.3).
+5. **The client composes.** Video detail (Catalog) and counts or comments (Interactions) are separate calls, so browsing and playback survive an Interactions outage.
 
 ---
 
@@ -31,13 +28,13 @@ Related: [Overview](./overview.md) · [Data Design](./data-design.md) · [Interf
 
 ![MyCilinder high-availability AWS architecture](../diagrams/architecture.png)
 
-*Figure 1: target architecture. The demo runs a throttled subset. Since the design review (§5, F1), the API is also served through CloudFront under `/api/*`.*
+*Figure 1: target architecture. The demo runs a throttled subset. Request routing is in §2.1.*
 
 > **C4 Level 1: System Context diagram goes here.**
 > Actors: Guest, Registered User / Creator, Platform Operator. External systems: Amazon Cognito, Cognito email, Vercel (optional web hosting).
 
 > **C4 Level 2: Container diagram goes here.**
-> Containers: Flutter client, CloudFront + WAF, API Gateway, internal ALB, the five services, Aurora, Redis, S3 `raw-videos` and `hls-output`, SQS `transcode-queue` and `video-status-queue`, SNS `video-events`.
+> Containers: Flutter client, CloudFront + WAF, API Gateway, internal ALB, the five services, RDS Proxy, Aurora, Redis, S3 `raw-videos` and `hls-output`, SQS `transcode-queue` and `video-status-queue`, SNS `video-events`.
 
 > **C4 Level 3: Component diagrams go here** (one per service, using the components in §4.2).
 
@@ -68,7 +65,7 @@ sequenceDiagram
   autonumber
   participant C as Flutter client
   participant U as Upload/Ingest
-  participant DB as Aurora
+  participant DB as Aurora (via RDS Proxy)
   participant S3 as S3 raw-videos
   participant Q as SQS transcode-queue
   participant T as Transcoder
@@ -149,7 +146,7 @@ Platform choices are in README §6.3. Region `us-east-1` and ffmpeg on Fargate S
 | Purpose | Go services (Auth, Catalog, Interactions) | Python services (Upload / Ingest, Transcoder) |
 |---------|-------------------------------------------|-----------------------------------------------|
 | HTTP server and routing | `net/http` with `go-chi/chi` | FastAPI on `uvicorn` (Upload only; the Transcoder has no HTTP API) |
-| PostgreSQL | `jackc/pgx` (with `pgxpool`) | `psycopg` 3 with `psycopg_pool` (Upload only) |
+| PostgreSQL (through RDS Proxy) | `jackc/pgx` (with `pgxpool`), query mode `QueryExecModeExec` so no named prepared statements are created | `psycopg` 3 with `psycopg_pool`, `prepare_threshold=None` (Upload only) |
 | Redis | `redis/go-redis` | not used |
 | AWS | AWS SDK for Go v2 | `boto3` |
 | JWT validation (Cognito JWKS) | `lestrrat-go/jwx` | `PyJWT` with its JWKS client |
@@ -162,6 +159,13 @@ Platform choices are in README §6.3. Region `us-east-1` and ffmpeg on Fargate S
 | Media | not used | `ffmpeg` / `ffprobe` as subprocesses, bundled in the worker image |
 
 API contracts are validated against `openapi.yaml` in CI (MAINT-01).
+
+**Driver settings for RDS Proxy.** The proxy reuses an Aurora connection for another client at the end of each transaction, unless the session holds state that would leak to that client. In that case it *pins* the client to one Aurora connection, which defeats pooling. For PostgreSQL, pinning is caused by session `SET` commands, named prepared statements, session-level advisory locks, temporary tables, `LISTEN`, and cursors declared outside a transaction. The rules that follow:
+- Drivers do not create named prepared statements (settings above). Queries remain parameterized (SEC-07).
+- Session settings (`search_path`, `statement_timeout`, `TimeZone`) are set per PostgreSQL role with `ALTER ROLE … SET`, or in the proxy's initialization query. Code uses `SET LOCAL` inside a transaction when it needs a different value.
+- Locks for background jobs are transaction-level (`pg_try_advisory_xact_lock`, §4.2).
+- Pools do not run `DISCARD ALL` as a reset query.
+- The CloudWatch metric `DatabaseConnectionsCurrentlySessionPinned` has an alarm, so a change that introduces pinning is visible.
 
 ---
 
@@ -206,7 +210,7 @@ Responsibilities per service are in README §3.2 and the FR areas below. This ta
 - *Spot:* on `SIGTERM` the worker stops and leaves the message untouched so it becomes visible again; the task `stopTimeout` is set to the maximum (120 seconds).
 - *Isolation:* ffmpeg runs as a non-root user with a read-only root filesystem and no database credentials.
 
-**Background jobs (F7).** Periodic work runs as loops inside the owning service. Every task runs the loop, but each run first takes a PostgreSQL advisory lock (`pg_try_advisory_lock`), so only one task does the work at a time and no scheduler component is needed.
+**Background jobs (F7).** Periodic work runs as loops inside the owning service. Every task runs the loop, but each run opens a transaction and first takes a transaction-level PostgreSQL advisory lock (`pg_try_advisory_xact_lock`). Only one task does the work at a time, and no scheduler component is needed. The lock is released at commit or rollback, so it does not pin the connection in RDS Proxy (§3), and a task that dies mid-run releases it when the proxy closes its transaction. Each run processes a bounded batch so the transaction stays short.
 
 ### 4.3 Sizing
 
@@ -215,6 +219,8 @@ Responsibilities per service are in README §3.2 and the FR areas below. This ta
 | Auth, Catalog, Interactions | ≤ 0.5 vCPU / 1 GB (PERF-09) | ≥ 2 each; about 10 API tasks at 1M DAU (NFR §5.7) | 1 each |
 | Upload / Ingest | 0.5 vCPU / 1 GB | 2 to 4 | 1 |
 | Transcoder | 2 vCPU / 4 GB; 30 GB ephemeral storage for a 1 GB source plus output | 0 to about 105 at 1M DAU peak (NFR §5.5); scales on queue backlog per task, with an alarm-based step from 0 to 1 | 0 to 2 |
+
+**Database connections.** Every database-using task keeps a small pool to RDS Proxy: at most 10 connections for the Go services and 5 for Upload / Ingest, released at the end of each transaction. The number of client connections grows with the number of tasks, and doubles briefly during a rolling deployment while old and new tasks overlap. The number of Aurora connections does not: the proxy's `MaxConnectionsPercent` caps it at a fixed share of Aurora's `max_connections`, leaving the rest for migrations and operator sessions. When every pooled connection is busy, the proxy queues new transactions up to its borrow timeout (set to 5 seconds) and then returns an error, which the service maps to `503` (Interface Design §1.1). The Transcoder has no database access and never counts against the pool.
 
 ### 4.4 Security boundaries (SEC-06)
 
@@ -226,7 +232,7 @@ Responsibilities per service are in README §3.2 and the FR areas below. This ta
 | Upload / Ingest | `PutObject` and multipart actions on `raw-videos`; its secrets |
 | Transcoder | `GetObject` on `raw-videos`; `PutObject` on `hls-output`; receive, delete, and change visibility on `transcode-queue`; publish to `video-events`. No database. |
 
-All tasks may also write traces to X-Ray through the collector sidecar. Each service uses its own PostgreSQL role with grants only on its own schema plus the read-only views (Data Design §1.1). Security groups chain VPC Link → ALB → services → Aurora and Redis, with no other ingress.
+All tasks may also write traces to X-Ray through the collector sidecar. Each service uses its own PostgreSQL role with grants only on its own schema plus the read-only views (Data Design §1.1). The role's credentials are a Secrets Manager secret that both the service and RDS Proxy can read; the proxy has its own IAM role limited to those secrets, and it requires TLS from clients. Security groups chain VPC Link → ALB → services → RDS Proxy → Aurora, and services → Redis, with no other ingress. Aurora accepts connections only from the proxy's security group.
 
 ### 4.5 Repository layout
 
@@ -264,5 +270,5 @@ Issues found while turning the baseline into a design. All resolutions were acce
 | F3 | **Per-user and per-IP rate limits (SEC-09).** An HTTP API throttles per route or stage, not per client. | Per IP: a WAF rate-based rule. Per user: a Redis counter in the shared library. API Gateway stage throttling remains as a global ceiling. |
 | F4 | **State ownership gaps.** (a) Nothing marks `UPLOADED`. (b) Two services wrote `videos`. (c) Reports, moderation, and profiles had no owning service. | (a) `UPLOADED` is transient (FR-UP-06). (b) Upload only inserts; Catalog owns every later change, enforced with PostgreSQL grants. (c) Auth owns profiles, Interactions owns reports and comment hiding, Catalog owns video hide and restore. |
 | F5 | **Jobs that crash never produce `FAILED`.** A message that reaches the DLQ after hard crashes or repeated Spot interruptions emits no event. | The worker emits `video.failed` on handled errors at the last attempt; Catalog's sweep marks videos still `PROCESSING` after 2 hours as `FAILED`; a DLQ alarm lets an operator re-drive the message. |
-| F6 | **Fixed hourly costs dominate the credits.** Always-on: NAT Gateways, ALB, Aurora, Redis nodes, interface VPC endpoints, WAF, idle Fargate tasks. SNS, Cognito, Secrets Manager, and X-Ray traffic goes through NAT. | Demo: one NAT, single-node Redis, Aurora writer only, minimum tasks 1, and destroy or scale to zero the expensive layers between sessions. Costs are estimated with the AWS Pricing Calculator before the Deployment gate. |
-| F7 | **No scheduler** for periodic work (expiry, stuck-state sweep, output cleanup, counter flush, reconciliation). | In-service loops under a PostgreSQL advisory lock (§4.2). No new component. |
+| F6 | **Fixed hourly costs dominate the credits.** Always-on: NAT Gateways, ALB, Aurora, RDS Proxy (billed for at least 8 ACUs with Aurora Serverless v2, whatever capacity Aurora uses), Redis nodes, interface VPC endpoints, WAF, idle Fargate tasks. SNS, Cognito, Secrets Manager, and X-Ray traffic goes through NAT. | Demo: one NAT, single-node Redis, Aurora writer only, minimum tasks 1, and destroy or scale to zero the expensive layers between sessions. Costs are estimated with the AWS Pricing Calculator before the Deployment gate. |
+| F7 | **No scheduler** for periodic work (expiry, stuck-state sweep, output cleanup, counter flush, reconciliation). | In-service loops under a transaction-level PostgreSQL advisory lock (§4.2), which is compatible with RDS Proxy. No new component. |

@@ -67,7 +67,7 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 
 ![MyCilinder high-availability AWS architecture](docs/diagrams/architecture.png)
 
-*Figure 1 — Target (design-scale) architecture. The deployed demo runs a throttled subset of this topology. Since the design review, the API is also served through CloudFront under `/api/*` and no custom domain is used (see [Architecture and Components](docs/design-description/architecture-and-components.md) §2.1 and §5).*
+*Figure 1 — Target (design-scale) architecture. The deployed demo runs a throttled subset of this topology. Request routing through CloudFront is detailed in [Architecture and Components](docs/design-description/architecture-and-components.md) §2.1.*
 
 **Upload → playback flow**
 1. Client requests a presigned upload URL from the Upload service.
@@ -79,7 +79,7 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 ### 3.1 Architecture drivers
 
 - **Highly available read/playback path:** every component on it is a managed, multi-AZ service; no single instance or AZ in the request path.
-- **Scalable by design:** stateless containers behind autoscaling, a CDN for media, and a cache plus read replica for metadata.
+- **Scalable by design:** stateless containers behind autoscaling, a CDN for media, a cache plus read replica for metadata, and RDS Proxy so the number of database connections does not grow with the number of containers.
 - **Media stays off compute:** presigned PUT in, CloudFront out; services only handle metadata and orchestration.
 - **Cost-aware:** transcoding runs on Fargate Spot, scaled by queue depth, with capped renditions and input length.
 - **Secure by default:** JWT validated at the edge, all compute and data in private subnets, private buckets.
@@ -108,7 +108,7 @@ The platform is **designed on paper to serve 100,000–1,000,000+ daily active u
 
 **Data, storage, and messaging**
 - **S3 `raw-videos`** (versioned, private) receives uploads via presigned URLs; **S3 `hls-output`** (private) is readable only through CloudFront.
-- **Aurora PostgreSQL** has a writer in AZ-a and a reader replica in AZ-b with automatic failover. **ElastiCache Redis** has a primary and replica in separate AZs and holds the hot feed cache and counters.
+- **Aurora PostgreSQL** has a writer in AZ-a and a reader replica in AZ-b with automatic failover. Services never connect to Aurora directly: they connect to **Amazon RDS Proxy**, deployed in the private-data subnets of both AZs. The proxy keeps a bounded pool of connections to Aurora and multiplexes the short-lived connections of the Fargate tasks onto it, so scale-out events, rolling deployments, and task replacements do not exhaust Aurora's connection limit. Its read/write endpoint targets the writer and its read-only endpoint targets the reader replica. **ElastiCache Redis** has a primary and replica in separate AZs and holds the hot feed cache and counters.
 - S3 `ObjectCreated` feeds the **SQS `transcode-queue`** (with a dead-letter queue). On completion the worker publishes to the **SNS `video-events`** topic; the subscribed **SQS `video-status-queue`** lets Catalog mark the video `READY` or `FAILED`.
 
 **Operations:** CloudWatch (logs, metrics, alarms) and X-Ray (traces) receive data from every service; ECR stores images, Secrets Manager holds credentials, and AWS Budgets raises billing alarms.
@@ -120,7 +120,8 @@ The key decision is that **playback does not depend on the VPC, the containers, 
 | Failure scenario | Behavior |
 |------------------|----------|
 | Single Fargate task fails | The ALB health check removes it and ECS replaces it; other tasks keep serving. |
-| Entire AZ unavailable | Traffic shifts to tasks in the other AZ; Aurora promotes its replica and Redis fails over. Clients retry with backoff during failover. |
+| Entire AZ unavailable | Traffic shifts to tasks in the other AZ; Aurora promotes its replica and Redis fails over. RDS Proxy keeps the services' client connections open and routes them to the new writer, so services do not have to rediscover the database. Clients retry with backoff during failover. |
+| Burst of new or replaced tasks | New tasks open connections to RDS Proxy, not to Aurora. The proxy reuses its existing pool and queues requests briefly when the pool is busy, so Aurora's connection count stays within its limit. |
 | Redis unavailable | Catalog falls back to Aurora (slower, still correct); Interactions buffers counter updates briefly. |
 | Transcoder crash or Spot interruption | The SQS message becomes visible again and is retried; repeated failures go to the DLQ and raise an alarm. Raw objects are retained, so any video can be re-queued. |
 | Upload spike | SQS absorbs the burst and the worker fleet scales on queue depth, up to a maximum that protects the budget. Playback is unaffected. |
@@ -129,7 +130,7 @@ Durability: S3 provides 11-nines durability with versioning on the raw bucket, a
 
 ### 3.4 Scalability and security
 
-- **Scalability:** services are stateless and scale horizontally behind the ALB; CloudFront, Redis, and Aurora readers absorb read load; like/view counters are batched into Aurora to avoid write hotspots; transcoding scales out and back to zero on queue depth. Known limits at 1M DAU: search should move to OpenSearch and comment writes may need sharding (§7).
+- **Scalability:** services are stateless and scale horizontally behind the ALB; CloudFront, Redis, and Aurora readers absorb read load; RDS Proxy decouples the number of Aurora connections from the number of tasks; like/view counters are batched into Aurora to avoid write hotspots; transcoding scales out and back to zero on queue depth. Known limits at 1M DAU: search should move to OpenSearch and comment writes may need sharding (§7).
 - **Security:** the only public surface is CloudFront, behind WAF. API Gateway's own endpoint rejects requests that do not carry CloudFront's secret origin header. Each ECS service has its own least-privilege task role, data is encrypted at rest and in transit, and secrets live in Secrets Manager.
 
 ---
@@ -215,6 +216,7 @@ The project follows a classic **waterfall** lifecycle. Each phase has a gate (ex
 | **Transcoding** | **ffmpeg on Fargate Spot** | Chosen over MediaConvert for cost. |
 | **CDN** | **CloudFront** | Signed cookies; caches HLS segments; the main playback path and the API entry point. |
 | **Relational DB** | **Aurora PostgreSQL Serverless v2** (writer + reader replica) | Users, videos, comments metadata. |
+| **DB connection pooling** | **Amazon RDS Proxy** | Sits between ECS and Aurora; shares a bounded connection pool across all tasks and shortens failover. |
 | **Cache / counters** | **ElastiCache Redis** | View counts, like counts, hot feed cache. |
 | **Search** | PostgreSQL full-text, Spanish configuration (MVP) → OpenSearch later | Keep it cheap for MVP. |
 | **IaC** | **Terraform** | Separate repo; `tfsec`/checkov in CI (R7). |

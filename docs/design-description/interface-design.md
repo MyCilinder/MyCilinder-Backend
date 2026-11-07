@@ -172,7 +172,7 @@ Consumers are idempotent: Catalog applies an event only if it moves the status f
 
 ### 2.2 Health endpoints
 
-Every HTTP service exposes `GET /healthz` (process alive, used by the container health check) and `GET /readyz` (database and required dependencies reachable, used by the ALB target group). They are served on the service port but not routed by the ALB to the internet (REL-11).
+Every HTTP service exposes `GET /healthz` (process alive, used by the container health check) and `GET /readyz` (database through RDS Proxy and required dependencies reachable, used by the ALB target group). They are served on the service port but not routed by the ALB to the internet (REL-11).
 
 ---
 
@@ -197,7 +197,7 @@ sequenceDiagram
   participant C as Flutter client
   participant A as Auth facade
   participant CG as Cognito
-  participant DB as Aurora (auth)
+  participant DB as Aurora (auth, via RDS Proxy)
   C->>A: POST /auth/login (email, password)
   A->>CG: InitiateAuth USER_PASSWORD_AUTH + SECRET_HASH
   CG-->>A: access, ID, refresh tokens
@@ -220,7 +220,8 @@ sequenceDiagram
 | S3 presigned URLs (SigV4) | Upload / Ingest | One key `raw/{videoId}/source`; `Content-Type` and `Content-Length` signed for single PUTs; 15-minute expiry (BR-LIM). |
 | CloudFront signed cookies | Catalog | RSA key pair: the public key is in a CloudFront trusted key group, the private key in Secrets Manager. |
 | SQS, SNS | Transcoder, Catalog | §2.1 |
-| Secrets Manager | All services | Database credentials, Cognito client secret, CloudFront private key, origin-verification header value. Read at startup (SEC-10). |
+| Secrets Manager | All services, RDS Proxy | Database credentials (one secret per service role, also read by RDS Proxy to authenticate to Aurora), Cognito client secret, CloudFront private key, origin-verification header value. Read at startup (SEC-10). |
+| RDS Proxy | Auth, Catalog, Interactions, Upload / Ingest | PostgreSQL wire protocol over TLS. A read/write endpoint (writer) and a read-only endpoint (reader replica). Drivers avoid session state that pins connections (Architecture §3). |
 | CloudWatch Logs, X-Ray | All services | JSON logs to stdout, shipped by the ECS log driver. Traces through the OpenTelemetry SDK to an AWS Distro for OpenTelemetry collector sidecar, which exports to X-Ray (MAINT-05, MAINT-06). |
 
 **Origin verification.** API Gateway's default endpoint is reachable from the internet, so CloudFront adds a secret `X-Origin-Verify` header to every `/api/*` request, and the shared middleware in each service rejects requests without it. This keeps WAF and the CloudFront rate limits in front of every API call.

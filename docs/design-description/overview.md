@@ -20,6 +20,7 @@ MyCilinder is a video-on-demand (VOD) platform with the core experience of a ser
 | Video is egress-heavy: about 225 TB/day at 1M DAU against about 100 GB/year of relational data (NFR §5.9). | A CDN serves all media; the read path is stateless, cached, and multi-AZ. |
 | Large uploads must not load the platform. | Direct-to-S3 presigned uploads; a queue absorbs bursts and workers scale on queue depth. |
 | Likes and views create write hotspots. | Counters are buffered in Redis and flushed in batches (eventually consistent). |
+| Containers are short-lived and their number changes with load; each task opening its own database connections would exhaust Aurora's connection limit during scale-out and deployments. | Amazon RDS Proxy sits between the services and Aurora and multiplexes task connections onto a bounded pool. |
 | A student budget cannot absorb a runaway bill. | Capped inputs, two renditions, Spot workers, quotas, budget alarms (R1, R2). |
 | Failures are normal (crashes, Spot reclaims, AZ loss). | No single point of failure on the read path, graceful degradation, idempotent consumers, dead-letter queue (REL-10 to REL-18). |
 
@@ -58,7 +59,7 @@ The design is judged against NFR1–NFR7 (README §2.2) and the detailed targets
 |--------|--------|------|
 | Load | 100k–1M DAU, ≈ 2,100 requests/s peak | ≈ 25 viewers, ≈ 50 requests/s, ≤ 30 short videos (NFR §5.8) |
 | Compute | ≥ 2 tasks per service across 2 AZs | 1 task per service |
-| Data stores | Aurora writer plus reader replica, Redis primary plus replica, in separate AZs | Single AZ |
+| Data stores | Aurora writer plus reader replica, Redis primary plus replica, in separate AZs; RDS Proxy in both AZs | Single AZ; RDS Proxy kept, targeting the writer only |
 | Availability | 99.9% read path | Best effort |
 
 Terraform variables switch between the two. HA behavior the demo does not exercise (such as AZ failover) is validated by review or a one-off test, and the test plan says so.
@@ -77,6 +78,7 @@ Terraform variables switch between the two. HA behavior the demo does not exerci
 | P8 | Public domain | **Default CloudFront domain** (`*.cloudfront.net`), no custom domain | Team decision: cheapest option. It needs no domain registration, Route 53 hosted zone, or certificate, and CloudFront provides TLS for it. |
 | P9 | API entry point | **API served through CloudFront** (`/api/*`) with WAF attached to the distribution | Design review F1 (Architecture §5). It also puts API and media on one domain for signed cookies (F2). |
 | P10 | Storage lifecycle | **Raw uploads move to S3 Glacier Flexible Retrieval after 30 days; HLS outputs of deleted videos are removed after 7 days** | Team decision (NFR §5.9). Raw uploads are still never deleted (BR-05). Details in the Data Design §3.3. |
+| P11 | Database connection management | **Amazon RDS Proxy** between ECS and Aurora; services never connect to Aurora directly | README §3.2. Fargate tasks are ephemeral and autoscaled, so per-task connections would grow with the task count and spike during deployments. The proxy keeps Aurora's connection count bounded and keeps client connections open during failover (Architecture §4.3, SCAL-09). |
 
 ---
 
@@ -105,6 +107,9 @@ User classes (Guest, Registered User, Creator, Platform Operator) are defined in
 | **SLO** | Service level objective: internal reliability target, for example 99.9% per month. |
 | **RPO / RTO** | Maximum acceptable data loss / time to restore service, both measured in time. |
 | **Failover** | Automatic switch to a standby (for example a database replica) when the primary fails. |
+| **Connection exhaustion** | The database refuses new connections because the clients together have opened more than its `max_connections` limit. |
+| **RDS Proxy / connection pooling** | Managed AWS proxy that keeps a shared pool of database connections and lends one to a client for each transaction, so many clients share few database connections. |
+| **Pinning** | RDS Proxy dedicating one database connection to one client for the whole session, because the session changed state (for example with `SET`). It reduces pooling and is avoided by design (Architecture §3). |
 | **Graceful degradation** | Losing a non-critical dependency reduces features or speed instead of causing a full outage. |
 | **Idempotency** | Repeating an operation has the same effect as doing it once. Needed because queue delivery is at-least-once. |
 | **Eventual consistency** | Reads may briefly lag writes. Counters can lag by a few seconds (A-10). |

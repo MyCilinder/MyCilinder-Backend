@@ -14,7 +14,7 @@ Related: [Overview](./overview.md) · [Architecture and Components](./architectu
 
 ### 1.1 Database layout
 
-One Aurora PostgreSQL Serverless v2 cluster holds one database with **one schema per service**. A service writes only to its own schema and reads other services' data only through read-only views. Each service connects with its own PostgreSQL role (Architecture §4.4).
+One Aurora PostgreSQL Serverless v2 cluster holds one database with **one schema per service**. A service writes only to its own schema and reads other services' data only through read-only views. Each service connects with its own PostgreSQL role (Architecture §4.4), always through Amazon RDS Proxy and never to an Aurora endpoint directly (Architecture §1, rule 4).
 
 | Schema | Owner (writer) | Tables | Views exposed to other services |
 |--------|----------------|--------|--------------------------------|
@@ -219,7 +219,7 @@ flowchart LR
 flowchart LR
   C[Client] -->|feeds, search, detail| CAT[Catalog]
   CAT -->|cache-aside| R[(Redis)]
-  CAT -->|on miss| RO[(Aurora reader)]
+  CAT -->|on miss| RO[(Aurora reader, via RDS Proxy)]
   C -->|counts, comments| INT[Interactions]
   INT -->|live counters| R
   INT -->|comments, fallback counts| RO
@@ -227,7 +227,7 @@ flowchart LR
   CF -->|cache miss, OAC| OUT[(S3 hls-output)]
 ```
 
-- Reads go to the Aurora reader endpoint. Writes and read-after-write checks (ownership, idempotency) go to the writer.
+- Reads go to the RDS Proxy read-only endpoint, which targets the Aurora reader. Writes and read-after-write checks (ownership, idempotency) go to the proxy's default read/write endpoint, which targets the writer. If the reader is unavailable, services send reads to the read/write endpoint. Each service has the two endpoints as configuration variables.
 - Lists use keyset pagination: the opaque cursor encodes the last row's sort key and `id`, so pages stay stable while new videos arrive and no query uses `OFFSET` (SCAL-06).
 - Feeds and search show the `view_count` from `video_stats`, which can lag by the flush interval plus the feed cache TTL (about 35 s). The video page reads live counters from Redis through Interactions (A-10).
 
@@ -276,7 +276,7 @@ ElastiCache Redis holds two kinds of keys with different durability needs. The e
 | `rl:{userId}:{class}:{minute}` | All API services | Per-user request count (SEC-09) | 60 s | Expiry only |
 
 - **Stampede protection:** Catalog collapses concurrent misses for the same key into one database query per task.
-- **Counter flush:** every 5 seconds the flusher takes up to a batch of ids from `stats:dirty`, reads and resets their deltas atomically (Lua script), and applies them with one batched `UPDATE` to `video_stats`. It runs under a PostgreSQL advisory lock, so only one task flushes at a time (Architecture §4.2).
+- **Counter flush:** every 5 seconds the flusher takes up to a batch of ids from `stats:dirty`, reads and resets their deltas atomically (Lua script), and applies them with one batched `UPDATE` to `video_stats`. It runs under a transaction-level PostgreSQL advisory lock, so only one task flushes at a time (Architecture §4.2).
 - **Reconciliation:** every hour, like and comment counts are recomputed from `likes` and visible `comments` rows and written to `video_stats` (BR-07). Views have no source rows; a lost flush loses at most 5 seconds of views.
 - **Redis unavailable:** Catalog reads from Aurora. Interactions serves counts from `video_stats`, keeps deltas in a bounded in-memory buffer that it flushes directly to Aurora, counts views without deduplication, and skips the per-user rate limit (the WAF per-IP limit still applies). REL-12 describes the expected behavior.
 

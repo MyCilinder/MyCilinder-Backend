@@ -90,7 +90,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 
 | ID | Requirement |
 |----|-------------|
-| REL-10 | **No single point of failure** in the design: services run as at least 2 tasks across 2 AZs; Aurora writer plus reader replica in separate AZs; Redis with a replica in another AZ. |
+| REL-10 | **No single point of failure** in the design: services run as at least 2 tasks across 2 AZs; Aurora writer plus reader replica in separate AZs; RDS Proxy deployed in subnets of both AZs; Redis with a replica in another AZ. |
 | REL-11 | **Stateless services:** no local session or file state, so any task can be killed and replaced. Health checks (`/healthz` liveness, `/readyz` readiness) drive automatic replacement. |
 | REL-12 | **Graceful degradation, by dependency:**<br>• Redis down: serve counts from PostgreSQL (slower, still correct).<br>• Interactions service down: playback and browsing continue.<br>• Transcoder or queue down: uploads are accepted and wait; nothing is lost.<br>• Cognito down: users with valid tokens continue; new logins fail. |
 | REL-13 | **Timeouts, retries, and circuit breakers** on every synchronous call. Retries use exponential backoff with jitter and apply only to idempotent operations. |
@@ -98,7 +98,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | REL-15 | **Idempotent writes:** likes and view events are idempotent by design. Upload requests accept a client-supplied idempotency key. |
 | REL-16 | **Backups:** automated Aurora backups with point-in-time recovery. A restore is tested at least once before the Deployment gate. |
 | REL-17 | **Safe deployments:** rolling deployment with health-check gating and automatic rollback on failed health checks. Database migrations are backward compatible with the previous release. |
-| REL-18 | **Composite availability:** the read path is a serial chain (CDN, edge, service, cache/DB). Its availability is roughly the product of the parts, so Multi-AZ and caching are used to keep each link above the 99.9% target. Provider SLAs are verified in Design. |
+| REL-18 | **Composite availability:** the read path is a serial chain (CDN, edge, service, cache, connection proxy, DB). Its availability is roughly the product of the parts, so Multi-AZ and caching are used to keep each link above the 99.9% target. Provider SLAs are verified in Design. |
 
 > **Demo deviation (documented, deliberate):** The Aurora reader replica and redundant Redis roughly double data-tier cost. The demo may run single-AZ with a single task per service to save credits. The design and Terraform modules support the Multi-AZ configuration via variables, and this deviation is called out in the design and test reports.
 
@@ -118,6 +118,7 @@ Related: [Overall Description](./overall-description.md) · [Functional Requirem
 | SCAL-06 | **Pagination everywhere:** cursor-based pagination with bounded page size. No unbounded list queries. |
 | SCAL-07 | **Growth path** documented in Design, without redesign: partition comments by video, move search to OpenSearch, add a per-region CDN strategy, and move to multi-region later (README §7). |
 | SCAL-08 | **Capacity headroom:** provision for ≥ 2× the expected peak. At 1M DAU the design must show no component that saturates below that. |
+| SCAL-09 | **Bounded database connections:** services reach Aurora only through a connection pooler (Amazon RDS Proxy). Each task's pool is capped, and the number of Aurora connections stays below a fixed share of its `max_connections` regardless of task count, scale-out events, or rolling deployments (§5.7). |
 
 ### 4.2 Maintainability
 
@@ -219,6 +220,11 @@ Transcoding is **bursty and queue-buffered**. Workers can be provisioned below p
 Assuming one Go API task handles ≈ 500 requests/s (checked by the load test in the Testing phase):
 - 1M DAU peak 2,100 req/s ÷ 500 ≈ 5 tasks at full utilization.
 - At 50% target utilization for headroom (SCAL-08), and spread across 2 AZs, about **10 API tasks in total** across Catalog, Interactions, and Auth.
+
+**Database connections (SCAL-09).** With pools of at most 10 connections per Go task and 5 per Upload task:
+- Steady peak: 10 API tasks × 10 + 4 Upload tasks × 5 ≈ **120 client connections**.
+- Rolling deployment, when old and new tasks overlap: ≈ **240 client connections**. A fast scale-out adds more on top.
+- Connected directly, each of those would be an Aurora backend process, and the count would track the task count. Through RDS Proxy, Aurora sees only the proxy's pool, capped by `MaxConnectionsPercent`. The pool needs about as many connections as transactions running at the same moment: at ≈ 2,100 requests/s and a few milliseconds of database time per request, that is a few tens of connections.
 
 ### 5.8 Demo-scale sizing
 
