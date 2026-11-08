@@ -58,7 +58,7 @@ erDiagram
     uuid owner_id "users.id"
     text title "1-100 chars"
     text description "0-5000 chars"
-    video_status status
+    video_status(enum) status
     text failure_reason "set when FAILED"
     text content_type "declared"
     bigint size_bytes "declared, max 1 GB"

@@ -251,7 +251,6 @@ MyCilinder-Backend/
 │   └── python/          # shared Python package
 ├── migrations/          # one folder per schema: auth, catalog, interactions, upload, audit
 ├── deploy/local/        # Docker Compose for local development
-├── .github/workflows/   # one pipeline per service, triggered by path
 └── docs/
 ```
 
