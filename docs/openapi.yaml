@@ -1,0 +1,2206 @@
+openapi: 3.2.1
+info:
+  title: MyCilinder
+  version: 1.0.0
+  summary: Client-facing API of the MyCilinder video-on-demand platform.
+  license:
+    name: MIT License
+    identifier: MIT
+  description: |
+    A VOD/OTT application designed for 100k-1M DAU (deployed at throttled demo scale).
+
+    This document is the machine-readable form of
+    `docs/design-description/interface-design.md` §1 and the single source of truth for the
+    client-facing API (MAINT-01). It is frozen at the Design gate; later changes require a
+    change request (C-06). Internal message contracts (SQS/SNS) and the `/healthz` and
+    `/readyz` health endpoints are not part of it (Interface Design §2).
+
+    ## Conventions
+    - REST over HTTPS (TLS 1.2+), JSON bodies, `camelCase` fields.
+    - All resource identifiers are UUIDs. Timestamps are RFC 3339 in UTC.
+    - Media bytes never pass through this API. Uploads go directly to S3 with presigned URLs;
+      playback goes through CloudFront with signed cookies.
+
+    ## Authentication
+    Send `Authorization: Bearer <access token>` with the Cognito **access token** returned by
+    `POST /auth/login`. API Gateway validates it on protected routes and the service validates
+    it again (SEC-01). Access level per operation:
+    - **Public:** no token.
+    - **Optional:** the token is used if sent (`security` includes `{}`).
+    - **JWT:** a valid token is required.
+    - **Owner:** a valid token, and the caller must own the resource (checked by the service,
+      never from client-supplied ids, SEC-02).
+    - **Operator:** a valid token whose `cognito:groups` claim contains `operators`.
+
+    ## Pagination
+    Lists accept `?cursor=<opaque>&limit=<n>` (default 20, maximum 50, BR-LIM) and return
+    `{ "items": [...], "nextCursor": "..." }`. `nextCursor` is `null` on the last page. Cursors
+    are opaque; clients must not parse or build them.
+
+    ## Errors
+    Every error uses RFC 9457 Problem Details (`application/problem+json`), see `Problem`.
+
+    ## Correlation
+    Clients may send `X-Correlation-Id`. The edge service generates one if absent and returns it
+    in the `X-Correlation-Id` response header of every response, and in `correlationId` of every
+    problem body (MAINT-05).
+
+    ## Rate limits
+    Per IP in AWS WAF and per user in the services (SEC-09). Starting values: 100 requests/min
+    per user for reads, 20/min for writes, 1 upload/min; login endpoints are throttled
+    separately. Rejections return `429` with `Retry-After`.
+
+    ## CORS
+    Allowed origins are the Vercel web domain and local development. Credentials are allowed,
+    because `GET /videos/{videoId}/playback` sets cookies (SEC-13).
+
+    ## Origin verification
+    CloudFront adds a secret `X-Origin-Verify` header to every `/api/*` request and the services
+    reject requests without it. Clients never send this header; it is not modeled here.
+servers:
+  - url: https://{distribution}.cloudfront.net/api/v1
+    name: aws
+    description: Deployed environment, on the default CloudFront domain (no custom domain).
+    variables:
+      distribution:
+        default: d111111abcdef8
+        description: CloudFront distribution subdomain, output by Terraform in MyCilinder-Infra.
+  - url: http://127.0.0.1:8000/api/v1
+    name: local
+    description: Local development with Docker Compose (`deploy/local/`).
+tags:
+  - name: Auth
+    summary: Accounts and tokens
+    description: Auth facade (Go). Wraps Amazon Cognito so the client never uses the Cognito SDK (R6).
+    kind: nav
+  - name: Profile
+    summary: My profile
+    description: Auth facade (Go). The local profile keyed by the Cognito `sub`.
+    kind: nav
+  - name: Uploads
+    summary: Upload and ingest
+    description: Upload / Ingest service (Python). Creates video records and issues presigned S3 upload URLs.
+    kind: nav
+  - name: Catalog
+    summary: Browse, search, and watch
+    description: Catalog service (Go). Feeds, search, video detail, and signed playback access.
+    kind: nav
+  - name: Studio
+    summary: Creator studio
+    description: Catalog service (Go). A creator's view and management of their own videos.
+    kind: nav
+  - name: Interactions
+    summary: Comments, likes, views, reports
+    description: Interactions service (Go). Counters are eventually consistent (BR-07).
+    kind: nav
+  - name: Moderation
+    summary: Operator-only routes
+    description: |
+      Restricted routes under `/ops`, served by Catalog (videos) and Interactions (comments,
+      reports). Each action writes an `audit_log` row (SEC-15).
+    kind: nav
+security:
+  - bearerAuth: []
+paths:
+  # ---------------------------------------------------------------------------
+  # Auth facade
+  # ---------------------------------------------------------------------------
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Register an account
+      description: |
+        Starts Cognito sign-up (`SignUp`). Cognito emails a verification code that must be sent
+        to `POST /auth/confirm` before the account can log in (FR-AUTH-01, FR-AUTH-02).
+
+        To avoid revealing whether an email is registered, the response for an already
+        registered email is the same `202` (UC-01 3a). A password that violates the policy
+        returns `400` with the failed rule in `errors` (UC-01 3b).
+
+        Access: **Public**.
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '202':
+          description: Sign-up accepted. A verification code was sent if the email is new.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/confirm:
+    post:
+      tags: [Auth]
+      operationId: confirmSignUp
+      summary: Confirm an account with the email code
+      description: |
+        Confirms the account with Cognito (`ConfirmSignUp`, FR-AUTH-02). A wrong or expired code
+        returns `400` with `errors[0].rule` set to `invalid-code` or `expired-code`; the client
+        can then call `POST /auth/resend-code` (UC-01 5a).
+
+        Access: **Public**.
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmRequest'
+      responses:
+        '204':
+          description: Account confirmed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/resend-code:
+    post:
+      tags: [Auth]
+      operationId: resendConfirmationCode
+      summary: Resend the verification code
+      description: |
+        Sends a new verification code (`ResendConfirmationCode`, UC-01 5a). Returns `204`
+        whether or not the email is registered or already confirmed.
+
+        Cognito's default email sender is limited to 50 emails per day per account (A-03).
+
+        Access: **Public**.
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResendCodeRequest'
+      responses:
+        '204':
+          description: Request accepted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in
+      description: |
+        Authenticates with Cognito (`InitiateAuth` with `USER_PASSWORD_AUTH` and `SECRET_HASH`)
+        and returns the token set (FR-AUTH-03). On the first successful login the service
+        creates the local profile keyed by the Cognito `sub` (FR-AUTH-05).
+
+        - Invalid credentials return a generic `401` and are throttled (UC-02 2a, SEC-09).
+        - An unconfirmed account returns `403` with `type` `/problems/forbidden` and
+          `errors[0].rule` `account-not-confirmed`; the client should go to the confirmation
+          step (UC-02 2b).
+
+        Access: **Public**.
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Refresh the access token
+      description: |
+        Exchanges a refresh token for new access and ID tokens (`InitiateAuth` with
+        `REFRESH_TOKEN_AUTH`, FR-AUTH-04). Refresh token rotation is disabled on the app client,
+        so the same refresh token stays valid until it expires (30 days) or is revoked, and no
+        new refresh token is returned.
+
+        An invalid, expired, or revoked refresh token returns `401`; the client must log in again.
+
+        Access: **Public** (the refresh token is the credential).
+      security: [{}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New tokens issued.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshedTokenSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Log out
+      description: |
+        Revokes the refresh token (`RevokeToken`, FR-AUTH-06). Revocation also invalidates the
+        access and ID tokens issued from it. Repeating the call with an already revoked token
+        returns `204`.
+
+        Access: **JWT**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+      responses:
+        '204':
+          description: Refresh token revoked.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------------------
+  # Profile (Auth facade) and creator studio list (Catalog)
+  # ---------------------------------------------------------------------------
+  /me:
+    get:
+      tags: [Profile]
+      operationId: getMyProfile
+      summary: Get my profile
+      description: |
+        Returns the caller's profile. `email` is read from Cognito (`GetUser`); the local
+        profile only stores the display name (SEC-12, FR-AUTH-08).
+
+        Access: **JWT**.
+      responses:
+        '200':
+          description: The caller's profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags: [Profile]
+      operationId: updateMyProfile
+      summary: Change my display name
+      description: |
+        Changes the display name (FR-AUTH-08). Display names are not unique.
+
+        Access: **JWT**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProfileRequest'
+      responses:
+        '200':
+          description: Updated profile.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyProfile'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /me/videos:
+    get:
+      tags: [Studio]
+      operationId: listMyVideos
+      summary: List my videos
+      description: |
+        The caller's own videos in every status except `DELETED`, newest first, with status,
+        failure reason, and counters (FR-CR-01, FR-CR-02).
+
+        Access: **JWT**.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of the caller's videos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OwnVideoPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------------------
+  # Upload / Ingest
+  # ---------------------------------------------------------------------------
+  /uploads:
+    post:
+      tags: [Uploads]
+      operationId: createUpload
+      summary: Start an upload
+      description: |
+        Validates the declared metadata against BR-LIM, consumes one unit of the caller's daily
+        quota (5 per UTC calendar day), creates the video in `PENDING_UPLOAD`, and returns upload
+        instructions (FR-UP-01, FR-UP-02, FR-UP-03, FR-UP-05).
+
+        - Files up to 100 MB get a single presigned `PUT` URL. The client must send exactly the
+          declared `Content-Type` and `Content-Length`, because both are signed.
+        - Files above 100 MB get a multipart upload: one presigned URL per part, then
+          `POST /uploads/{videoId}/complete`.
+        - URLs expire after 15 minutes (BR-LIM). Use `POST /uploads/{videoId}/urls` for fresh ones.
+        - The object key is `raw/{videoId}/source`. When it lands in S3 the transcode job is
+          queued automatically; the client does nothing else for single uploads.
+
+        **Idempotency.** `Idempotency-Key` is required (REL-15). Repeating a key with the same
+        body returns `201` with the original `videoId` and freshly signed URLs, and does not
+        consume quota again. Repeating it with a different body returns `409`.
+
+        The declared values are checked again on the real file by the Transcoder (FR-UP-07);
+        a mismatch turns the video `FAILED` with a reason.
+
+        Access: **JWT** (verified accounts only, BR-01).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUploadRequest'
+            examples:
+              small:
+                summary: Single PUT upload (up to 100 MB)
+                dataValue:
+                  title: Mi primer video
+                  description: Un recorrido por el campus del ITESO.
+                  fileName: campus.mp4
+                  contentType: video/mp4
+                  sizeBytes: 52428800
+                  durationSeconds: 95
+      responses:
+        '201':
+          description: Video created in `PENDING_UPLOAD`; upload instructions returned.
+          headers:
+            Location:
+              description: URL of the new video, `/api/v1/videos/{videoId}`.
+              schema:
+                type: string
+                format: uri-reference
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadInstructions'
+              examples:
+                singlePut:
+                  summary: Single PUT
+                  dataValue:
+                    videoId: 8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01
+                    method: PUT
+                    uploadUrl: https://mycilinder-raw-videos.s3.us-east-1.amazonaws.com/raw/8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01/source?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=...
+                    requiredHeaders:
+                      Content-Type: video/mp4
+                      Content-Length: '52428800'
+                    expiresAt: '2026-11-01T02:15:00Z'
+                multipart:
+                  summary: Multipart (above 100 MB)
+                  dataValue:
+                    videoId: 8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01
+                    method: MULTIPART
+                    partSizeBytes: 67108864
+                    parts:
+                      - partNumber: 1
+                        url: https://mycilinder-raw-videos.s3.us-east-1.amazonaws.com/raw/8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01/source?partNumber=1&uploadId=...&X-Amz-Signature=...
+                      - partNumber: 2
+                        url: https://mycilinder-raw-videos.s3.us-east-1.amazonaws.com/raw/8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01/source?partNumber=2&uploadId=...&X-Amz-Signature=...
+                    expiresAt: '2026-11-01T02:15:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/LimitExceeded'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /uploads/{videoId}/urls:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    post:
+      tags: [Uploads]
+      operationId: refreshUploadUrls
+      summary: Get fresh upload URLs
+      description: |
+        Re-signs the upload URL(s) of a video that is still in `PENDING_UPLOAD`, after the
+        previous URLs expired or the upload was interrupted (UC-03 4a, 4b, FR-UP-09). For a
+        multipart upload, `partNumbers` limits the response to the parts the client still needs;
+        if omitted, every part is re-signed. Does not consume quota.
+
+        Returns `409` when the video is no longer `PENDING_UPLOAD` (already uploaded,
+        processing, or `EXPIRED` after 24 hours).
+
+        Access: **Owner**.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshUploadUrlsRequest'
+      responses:
+        '200':
+          description: Fresh upload instructions.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadInstructions'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /uploads/{videoId}/complete:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    post:
+      tags: [Uploads]
+      operationId: completeMultipartUpload
+      summary: Complete a multipart upload
+      description: |
+        Multipart only (FR-UP-05). The client sends every part number with the `ETag` that S3
+        returned for that part's `PUT`, and the service calls S3 `CompleteMultipartUpload`.
+        S3 then emits `ObjectCreated` and the transcode job is queued.
+
+        The raw bucket's CORS configuration exposes the `ETag` response header so browser
+        clients can read it.
+
+        - `409` when the video is not a multipart upload or is no longer `PENDING_UPLOAD`.
+        - `400` when S3 rejects the part list (missing part, wrong `ETag`, parts out of order,
+          or a non-final part smaller than 5 MiB).
+
+        Access: **Owner**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteMultipartRequest'
+      responses:
+        '204':
+          description: Upload completed; the object is in S3.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------------------
+  # Catalog
+  # ---------------------------------------------------------------------------
+  /feed:
+    get:
+      tags: [Catalog]
+      operationId: getFeed
+      summary: Browse the feed
+      description: |
+        `READY` videos only (FR-BR-06), sorted by `recent` (newest `publishedAt` first,
+        FR-BR-01) or `most_viewed` (all-time view count, FR-BR-02). View counts are eventually
+        consistent (BR-07).
+
+        Access: **Public**.
+      security: [{}]
+      parameters:
+        - name: sort
+          in: query
+          required: false
+          description: Feed order.
+          schema:
+            type: string
+            enum: [recent, most_viewed]
+            default: recent
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of video cards.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoCardPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /search:
+    get:
+      tags: [Catalog]
+      operationId: searchVideos
+      summary: Search videos
+      description: |
+        PostgreSQL full-text search with the Spanish configuration over title (weight A) and
+        description (weight B), ranked by relevance (FR-BR-03). `READY` videos only. No results
+        returns `200` with an empty `items` array (UC-05 2a).
+
+        Access: **Public**.
+      security: [{}]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search text. Interpreted as plain words, not as query syntax.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+          example: recorrido campus
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A ranked page of video cards.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoCardPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /creators/{userId}/videos:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Catalog]
+      operationId: listCreatorVideos
+      summary: List a creator's videos
+      description: |
+        A creator's `READY` videos, newest first (FR-BR-07).
+
+        Access: **Public**.
+      security: [{}]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of video cards.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoCardPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /videos/{videoId}:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    get:
+      tags: [Catalog]
+      operationId: getVideo
+      summary: Get video detail
+      description: |
+        Video detail for the permalink `/watch/{videoId}` (FR-PB-01, FR-PB-05). Like and comment
+        counts are not included; get them from `GET /videos/{videoId}/stats`.
+
+        - Non-owners and guests get only `READY` videos. Any other status, or an unknown id,
+          returns `404` (FR-PB-06, BR-09).
+        - The owner also gets their non-ready videos (except `DELETED`), with `status` and,
+          for `FAILED`, `failureReason`.
+
+        Access: **Optional**.
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Video detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags: [Studio]
+      operationId: updateVideo
+      summary: Edit my video
+      description: |
+        Changes the title and/or description of the caller's own video (FR-CR-03). At least one
+        field is required. Allowed in any status except `DELETED`.
+
+        Access: **Owner**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateVideoRequest'
+      responses:
+        '200':
+          description: Updated video detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      tags: [Studio]
+      operationId: deleteVideo
+      summary: Delete my video
+      description: |
+        Soft delete (BR-05): the status becomes `DELETED` and the video disappears from every
+        list and from playback immediately (FR-CR-04). The raw upload is kept. Deleting an
+        already deleted video returns `404`.
+
+        Access: **Owner**.
+      responses:
+        '204':
+          description: Video deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /videos/{videoId}/playback:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    get:
+      tags: [Catalog]
+      operationId: getPlaybackAccess
+      summary: Get signed playback access
+      description: |
+        Checks visibility (FR-PB-06) and returns CloudFront **signed cookies** with a custom
+        policy for `https://{distribution}.cloudfront.net/videos/{videoId}/*`, valid for 2 hours
+        (BR-LIM, FR-PB-02). One cookie set covers the master playlist, the variant playlists,
+        and every segment.
+
+        - **Web:** the browser stores the three `Set-Cookie` headers. Each has
+          `Path=/videos/{videoId}/; Secure; HttpOnly; SameSite=None; Partitioned`, so cookies
+          for several videos coexist and a web client on the Vercel domain can use them. The
+          request must be made with credentials (`withCredentials` / `credentials: include`).
+        - **Android:** native players do not share a browser cookie jar, so the player sends the
+          values in `cookies` as a `Cookie` header on every media request.
+        - **Expiry mid-session:** call this endpoint again and continue (UC-04 3a).
+
+        Thumbnails are not signed (BR-06). Only `READY` videos are playable; the owner of a
+        non-ready video gets `409`.
+
+        Access: **Optional**.
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Playback access granted.
+          headers:
+            Set-Cookie:
+              description: |
+                Three cookies, one header line each: `CloudFront-Policy`, `CloudFront-Signature`,
+                and `CloudFront-Key-Pair-Id`. Following OpenAPI 3.2 §4.21.3, each array item is
+                one `Set-Cookie` line.
+              required: true
+              schema:
+                type: array
+                minItems: 3
+                maxItems: 3
+                items:
+                  type: string
+              example:
+                - CloudFront-Policy=eyJTdGF0ZW1lbnQiOlt7...; Path=/videos/8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01/; Max-Age=7200; Secure; HttpOnly; SameSite=None; Partitioned
+                - CloudFront-Signature=dGhpcyBpcyBub3QgYSByZWFs...; Path=/videos/8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01/; Max-Age=7200; Secure; HttpOnly; SameSite=None; Partitioned
+                - CloudFront-Key-Pair-Id=K2JCJMDEHXQW5F; Path=/videos/8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01/; Max-Age=7200; Secure; HttpOnly; SameSite=None; Partitioned
+            Cache-Control:
+              $ref: '#/components/headers/CacheControlNoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlaybackAccess'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------------------
+  # Interactions
+  # ---------------------------------------------------------------------------
+  /videos/{videoId}/stats:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    get:
+      tags: [Interactions]
+      operationId: getVideoStats
+      summary: Get video counters
+      description: |
+        View, like, and comment counts (eventually consistent, BR-07). `likedByMe` is present
+        only when a token is sent (FR-IN-07). `404` for videos that are not visible to the caller.
+
+        Access: **Optional**.
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Counters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /videos/{videoId}/comments:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    get:
+      tags: [Interactions]
+      operationId: listComments
+      summary: List comments
+      description: |
+        Visible comments (not hidden by an operator), newest first (FR-IN-02). Comments are
+        flat; there are no replies (FR-IN-09).
+
+        Access: **Public**.
+      security: [{}]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of comments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommentPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [Interactions]
+      operationId: createComment
+      summary: Post a comment
+      description: |
+        Posts a text comment on a `READY` video (FR-IN-01). Comments cannot be edited or
+        deleted by users (FR-IN-03, FR-IN-08). `404` when the video is not `READY`.
+
+        Access: **JWT**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCommentRequest'
+      responses:
+        '201':
+          description: Comment created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /videos/{videoId}/like:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    put:
+      tags: [Interactions]
+      operationId: likeVideo
+      summary: Like a video
+      description: |
+        Records the caller's like. Idempotent: at most one like per user and video (BR-04,
+        FR-IN-05); repeating the request returns the same state. `404` when the video is not
+        `READY`.
+
+        Access: **JWT**.
+      responses:
+        '200':
+          description: Current like state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LikeState'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      tags: [Interactions]
+      operationId: unlikeVideo
+      summary: Remove my like
+      description: |
+        Removes the caller's like (FR-IN-06). Idempotent: removing a like that does not exist
+        returns `200` with `liked: false`.
+
+        Access: **JWT**.
+      responses:
+        '200':
+          description: Current like state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LikeState'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /videos/{videoId}/views:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    post:
+      tags: [Interactions]
+      operationId: recordView
+      summary: Record a view
+      description: |
+        Call once when playback starts (FR-PB-04). Deduplicated by BR-VIEW: repeat views by the
+        same viewer on the same video within 30 minutes are not counted again, and still
+        return `202`. The viewer is the token's user, or `X-Session-Id` for guests. A guest
+        request without `X-Session-Id` returns `400`.
+
+        Access: **Optional**.
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '202':
+          description: View accepted (counted, or ignored as a duplicate).
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /reports:
+    post:
+      tags: [Interactions]
+      operationId: createReport
+      summary: Report a video or comment
+      description: |
+        Files a report (FR-MOD-01). A user can have only one `OPEN` report per target; a
+        duplicate returns `409` (FR-MOD-02). `404` when the target does not exist or is not
+        visible to the caller.
+
+        Access: **JWT**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReportRequest'
+      responses:
+        '201':
+          description: Report created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ---------------------------------------------------------------------------
+  # Moderation (operators)
+  # ---------------------------------------------------------------------------
+  /ops/videos/{videoId}/hide:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    post:
+      tags: [Moderation]
+      operationId: hideVideo
+      summary: Hide a video
+      description: |
+        Moves a video from `READY` to `HIDDEN` (FR-MOD-04). It disappears from lists and
+        playback, including shared permalinks (BR-09). Any other current status returns `409`.
+
+        Access: **Operator**.
+      security:
+        - bearerAuth: [operators]
+      responses:
+        '204':
+          description: Video hidden.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /ops/videos/{videoId}/restore:
+    parameters:
+      - $ref: '#/components/parameters/VideoId'
+    post:
+      tags: [Moderation]
+      operationId: restoreVideo
+      summary: Restore a hidden video
+      description: |
+        Moves a video from `HIDDEN` back to `READY` (FR-MOD-04). Any other current status
+        returns `409`.
+
+        Access: **Operator**.
+      security:
+        - bearerAuth: [operators]
+      responses:
+        '204':
+          description: Video restored.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /ops/reports:
+    get:
+      tags: [Moderation]
+      operationId: listReports
+      summary: List reports
+      description: |
+        The report queue, oldest first, filtered by status (FR-MOD-03).
+
+        Access: **Operator**.
+      security:
+        - bearerAuth: [operators]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Report status to list.
+          schema:
+            $ref: '#/components/schemas/ReportStatus'
+            default: OPEN
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of reports.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /ops/reports/{reportId}:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    patch:
+      tags: [Moderation]
+      operationId: resolveReport
+      summary: Resolve or dismiss a report
+      description: |
+        Sets an `OPEN` report to `RESOLVED` or `DISMISSED` and records the operator and time
+        (FR-MOD-03). A report that is not `OPEN` returns `409`. Hiding the target is a separate
+        call (`/ops/videos/{videoId}/hide` or `/ops/comments/{commentId}/hide`).
+
+        Access: **Operator**.
+      security:
+        - bearerAuth: [operators]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateReportRequest'
+      responses:
+        '200':
+          description: Updated report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /ops/comments/{commentId}/hide:
+    parameters:
+      - $ref: '#/components/parameters/CommentId'
+    post:
+      tags: [Moderation]
+      operationId: hideComment
+      summary: Hide a comment
+      description: |
+        Hides a comment (FR-MOD-04). It is excluded from lists and from the comment count.
+        Hiding an already hidden comment returns `204`.
+
+        Access: **Operator**.
+      security:
+        - bearerAuth: [operators]
+      responses:
+        '204':
+          description: Comment hidden.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Amazon Cognito user pool **access token** from `POST /auth/login` or
+        `POST /auth/refresh` (lifetime 1 hour). Validated by the API Gateway JWT authorizer
+        (issuer is the user pool, audience is the app client) and again by each service.
+
+        Operator routes list the role `operators`, which must appear in the token's
+        `cognito:groups` claim.
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from a previous page's `nextCursor`. Omit for the first page.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size (BR-LIM).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 20
+    VideoId:
+      name: videoId
+      in: path
+      required: true
+      description: Video id.
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: userId
+      in: path
+      required: true
+      description: User id (the Cognito `sub`).
+      schema:
+        type: string
+        format: uuid
+    CommentId:
+      name: commentId
+      in: path
+      required: true
+      description: Comment id.
+      schema:
+        type: string
+        format: uuid
+    ReportId:
+      name: reportId
+      in: path
+      required: true
+      description: Report id.
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Client-generated key, unique per upload attempt (a UUID is recommended). Scoped to the
+        caller (REL-15).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      example: 5f0e6b7c-1d2a-4c3b-9e8f-7a6b5c4d3e2f
+    SessionId:
+      name: X-Session-Id
+      in: header
+      required: false
+      description: |
+        Required for guests. A UUID the client generates once and stores locally. Used only for
+        view deduplication (BR-VIEW). Ignored when a token is sent.
+      schema:
+        type: string
+        format: uuid
+
+  headers:
+    CorrelationId:
+      description: Correlation id of the request, propagated in logs and traces (MAINT-05).
+      schema:
+        type: string
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    CacheControlNoStore:
+      description: Responses carrying credentials or signed URLs must not be cached.
+      schema:
+        type: string
+        const: no-store
+
+  responses:
+    BadRequest:
+      description: Validation failed (`/problems/validation-error`). `errors` lists each field.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/validation-error
+            title: Request validation failed
+            status: 400
+            detail: title must be 1-100 characters
+            instance: /api/v1/uploads
+            correlationId: 4f1c9a2e-7b3d-4e5f-8a6b-1c2d3e4f5a6b
+            errors:
+              - field: title
+                rule: length
+    Unauthorized:
+      description: Missing, expired, or invalid token, or invalid credentials (`/problems/unauthenticated`).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+        WWW-Authenticate:
+          description: Present when a bearer token was missing or invalid.
+          schema:
+            type: string
+          example: Bearer error="invalid_token"
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unauthenticated
+            title: Authentication required
+            status: 401
+            correlationId: 4f1c9a2e-7b3d-4e5f-8a6b-1c2d3e4f5a6b
+    Forbidden:
+      description: Not the owner, not an operator, or account not confirmed (`/problems/forbidden`).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/forbidden
+            title: Forbidden
+            status: 403
+            detail: Only the owner can modify this video.
+            correlationId: 4f1c9a2e-7b3d-4e5f-8a6b-1c2d3e4f5a6b
+    NotFound:
+      description: |
+        Unknown resource, or a video that is not `READY` for a non-owner (`/problems/not-found`,
+        FR-PB-06). Hidden and deleted content returns this response, not `403`.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/not-found
+            title: Not found
+            status: 404
+            correlationId: 4f1c9a2e-7b3d-4e5f-8a6b-1c2d3e4f5a6b
+    Conflict:
+      description: |
+        Duplicate open report, idempotency key reused with a different body, or invalid status
+        transition (`/problems/conflict`).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/conflict
+            title: Conflict
+            status: 409
+            detail: Video is not in PENDING_UPLOAD.
+            correlationId: 4f1c9a2e-7b3d-4e5f-8a6b-1c2d3e4f5a6b
+    LimitExceeded:
+      description: |
+        A BR-LIM rule was violated: format, size, or declared duration (`/problems/limit-exceeded`).
+        `detail` names the rule.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/limit-exceeded
+            title: Limit exceeded
+            status: 422
+            detail: sizeBytes exceeds the maximum file size of 1 GB.
+            correlationId: 4f1c9a2e-7b3d-4e5f-8a6b-1c2d3e4f5a6b
+            errors:
+              - field: sizeBytes
+                rule: max-file-size
+    TooManyRequests:
+      description: |
+        Rate limit (`/problems/rate-limited`) or daily upload quota (`/problems/quota-exceeded`).
+        For the daily quota, `Retry-After` points to the next UTC midnight.
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/quota-exceeded
+            title: Daily upload quota exceeded
+            status: 429
+            detail: The limit is 5 uploads per UTC day.
+            correlationId: 4f1c9a2e-7b3d-4e5f-8a6b-1c2d3e4f5a6b
+    ServiceUnavailable:
+      description: A required dependency is down or its circuit is open (`/problems/unavailable`).
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/CorrelationId'
+        Retry-After:
+          description: Seconds to wait before retrying, when known.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/unavailable
+            title: Service temporarily unavailable
+            status: 503
+            correlationId: 4f1c9a2e-7b3d-4e5f-8a6b-1c2d3e4f5a6b
+
+  schemas:
+    # -------------------------------------------------------------------------
+    # Common
+    # -------------------------------------------------------------------------
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details.
+      required: [type, title, status, correlationId]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          enum:
+            - /problems/validation-error
+            - /problems/unauthenticated
+            - /problems/forbidden
+            - /problems/not-found
+            - /problems/conflict
+            - /problems/limit-exceeded
+            - /problems/rate-limited
+            - /problems/quota-exceeded
+            - /problems/unavailable
+        title:
+          type: string
+          description: Short, human-readable summary of the problem type.
+        status:
+          type: integer
+          description: HTTP status code.
+          enum: [400, 401, 403, 404, 409, 422, 429, 503]
+        detail:
+          type: string
+          description: Human-readable explanation of this occurrence.
+        instance:
+          type: string
+          format: uri-reference
+          description: Request path that produced the problem.
+        correlationId:
+          type: string
+          description: Same value as the `X-Correlation-Id` response header.
+        errors:
+          type: array
+          description: Per-field violations, for `validation-error` and `limit-exceeded`.
+          items:
+            $ref: '#/components/schemas/FieldError'
+    FieldError:
+      type: object
+      required: [rule]
+      properties:
+        field:
+          type: string
+          description: Field name, or header name for header violations. Absent for request-level rules.
+          example: title
+        rule:
+          type: string
+          description: |
+            Machine-readable rule id, for example `required`, `length`, `format`, `enum`,
+            `password-policy`, `invalid-code`, `expired-code`, `account-not-confirmed`,
+            `max-file-size`, `max-duration`, `unsupported-format`, `session-id-required`.
+          example: length
+        message:
+          type: string
+          description: Human-readable explanation, for example which password rule failed.
+    Cursor:
+      type: [string, 'null']
+      description: Cursor for the next page, or `null` on the last page.
+    VideoId:
+      type: string
+      format: uuid
+      example: 8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01
+    Title:
+      type: string
+      minLength: 1
+      maxLength: 100
+      description: 1-100 characters (BR-LIM).
+      example: Mi primer video
+    Description:
+      type: string
+      minLength: 0
+      maxLength: 5000
+      description: 0-5,000 characters (BR-LIM).
+      example: Un recorrido por el campus del ITESO.
+    DisplayName:
+      type: string
+      minLength: 1
+      maxLength: 50
+      description: Not unique.
+      example: Diego Gomez
+    Email:
+      type: string
+      format: email
+      maxLength: 254
+      example: diego@example.com
+    Rendition:
+      type: string
+      enum: ['360p', '720p']
+      description: HLS rendition. A source below 720p yields only the renditions at or below its resolution (FR-TR-02).
+    VideoStatus:
+      type: string
+      description: |
+        Stored video status (Functional Requirements §1.0). `UPLOADED` is transient and never
+        returned.
+      enum: [PENDING_UPLOAD, PROCESSING, READY, FAILED, HIDDEN, DELETED, EXPIRED]
+    UserRef:
+      type: object
+      required: [id, displayName]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: User id (the Cognito `sub`).
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+
+    # -------------------------------------------------------------------------
+    # Auth and profile
+    # -------------------------------------------------------------------------
+    Password:
+      type: string
+      format: password
+      minLength: 8
+      maxLength: 256
+      writeOnly: true
+      description: |
+        Cognito password policy (SEC-11): at least 8 characters with at least one lowercase
+        letter, one uppercase letter, one number, and one special character.
+    RegisterRequest:
+      type: object
+      required: [email, password, displayName]
+      additionalProperties: false
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          $ref: '#/components/schemas/Password'
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+    ConfirmRequest:
+      type: object
+      required: [email, code]
+      additionalProperties: false
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        code:
+          type: string
+          pattern: '^[0-9]{6}$'
+          description: 6-digit verification code from the email.
+          example: '123456'
+    ResendCodeRequest:
+      type: object
+      required: [email]
+      additionalProperties: false
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+    LoginRequest:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 256
+          writeOnly: true
+    TokenSet:
+      type: object
+      required: [accessToken, idToken, refreshToken, expiresIn, tokenType]
+      properties:
+        accessToken:
+          type: string
+          description: 'Send as `Authorization: Bearer <accessToken>`.'
+        idToken:
+          type: string
+          description: Cognito ID token, for client-side display only. Not accepted by the API.
+        refreshToken:
+          type: string
+          description: Valid for 30 days. Store it securely.
+        expiresIn:
+          type: integer
+          description: Access and ID token lifetime in seconds.
+          example: 3600
+        tokenType:
+          type: string
+          const: Bearer
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      additionalProperties: false
+      properties:
+        refreshToken:
+          type: string
+          minLength: 1
+    RefreshedTokenSet:
+      type: object
+      required: [accessToken, idToken, expiresIn, tokenType]
+      properties:
+        accessToken:
+          type: string
+        idToken:
+          type: string
+        expiresIn:
+          type: integer
+          example: 3600
+        tokenType:
+          type: string
+          const: Bearer
+    LogoutRequest:
+      type: object
+      required: [refreshToken]
+      additionalProperties: false
+      properties:
+        refreshToken:
+          type: string
+          minLength: 1
+          description: The refresh token to revoke.
+    MyProfile:
+      type: object
+      required: [id, email, displayName, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The Cognito `sub`.
+        email:
+          $ref: '#/components/schemas/Email'
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+        createdAt:
+          type: string
+          format: date-time
+    UpdateProfileRequest:
+      type: object
+      required: [displayName]
+      additionalProperties: false
+      properties:
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+
+    # -------------------------------------------------------------------------
+    # Uploads
+    # -------------------------------------------------------------------------
+    CreateUploadRequest:
+      type: object
+      required: [title, fileName, contentType, sizeBytes]
+      additionalProperties: false
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/Description'
+        fileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Original file name, for display only. It does not affect the S3 key.
+          example: campus.mp4
+        contentType:
+          type: string
+          enum: [video/mp4, video/quicktime, video/webm]
+          description: |
+            Declared MIME type: MP4, MOV, or WebM (BR-LIM). An unlisted type returns `422`
+            with rule `unsupported-format`.
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1073741824
+          description: Declared file size in bytes. Maximum 1 GB (BR-LIM).
+          example: 52428800
+        durationSeconds:
+          type: integer
+          minimum: 1
+          maximum: 600
+          description: |
+            Optional declared duration, read by the client from the file. Maximum 10 minutes
+            (BR-LIM). The Transcoder enforces the limit on the real file regardless (FR-UP-07).
+          example: 95
+    UploadInstructions:
+      description: Single `PUT` upload (up to 100 MB) or multipart upload (above 100 MB).
+      oneOf:
+        - $ref: '#/components/schemas/SingleUpload'
+        - $ref: '#/components/schemas/MultipartUpload'
+      discriminator:
+        propertyName: method
+        mapping:
+          PUT: '#/components/schemas/SingleUpload'
+          MULTIPART: '#/components/schemas/MultipartUpload'
+    SingleUpload:
+      type: object
+      required: [videoId, method, uploadUrl, requiredHeaders, expiresAt]
+      properties:
+        videoId:
+          $ref: '#/components/schemas/VideoId'
+        method:
+          type: string
+          const: PUT
+        uploadUrl:
+          type: string
+          format: uri
+          description: Presigned S3 `PUT` URL for `raw/{videoId}/source`.
+        requiredHeaders:
+          type: object
+          description: Headers the client must send unchanged on the `PUT`; they are part of the signature.
+          required: [Content-Type, Content-Length]
+          properties:
+            Content-Type:
+              type: string
+              example: video/mp4
+            Content-Length:
+              type: string
+              example: '52428800'
+        expiresAt:
+          type: string
+          format: date-time
+          description: URL expiry, 15 minutes after issue (BR-LIM).
+    MultipartUpload:
+      type: object
+      required: [videoId, method, partSizeBytes, parts, expiresAt]
+      properties:
+        videoId:
+          $ref: '#/components/schemas/VideoId'
+        method:
+          type: string
+          const: MULTIPART
+        partSizeBytes:
+          type: integer
+          format: int64
+          description: |
+            Size of every part except the last, which holds the remainder. Part `n` covers
+            bytes `[(n-1) * partSizeBytes, n * partSizeBytes)` of the file.
+          example: 67108864
+        parts:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          items:
+            $ref: '#/components/schemas/UploadPartUrl'
+        expiresAt:
+          type: string
+          format: date-time
+          description: URL expiry, 15 minutes after issue (BR-LIM).
+    UploadPartUrl:
+      type: object
+      required: [partNumber, url]
+      properties:
+        partNumber:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        url:
+          type: string
+          format: uri
+          description: Presigned S3 `UploadPart` URL. The response's `ETag` header is needed to complete the upload.
+    RefreshUploadUrlsRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        partNumbers:
+          type: array
+          description: Multipart only. Parts to re-sign; omit to re-sign every part.
+          minItems: 1
+          maxItems: 10000
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+            maximum: 10000
+    CompleteMultipartRequest:
+      type: object
+      required: [parts]
+      additionalProperties: false
+      properties:
+        parts:
+          type: array
+          description: Every uploaded part, in ascending `partNumber` order.
+          minItems: 1
+          maxItems: 10000
+          items:
+            $ref: '#/components/schemas/CompletedPart'
+    CompletedPart:
+      type: object
+      required: [partNumber, eTag]
+      additionalProperties: false
+      properties:
+        partNumber:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        eTag:
+          type: string
+          minLength: 1
+          description: The `ETag` header S3 returned for the part, sent as received.
+          example: '"a54357aff0632cce46d942af68356b38"'
+
+    # -------------------------------------------------------------------------
+    # Catalog
+    # -------------------------------------------------------------------------
+    VideoCard:
+      type: object
+      description: List item (FR-BR-05). Only `READY` videos appear in lists.
+      required: [id, title, thumbnailUrl, creator, durationSeconds, viewCount, publishedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/VideoId'
+        title:
+          $ref: '#/components/schemas/Title'
+        thumbnailUrl:
+          type: string
+          format: uri
+          description: Unsigned CloudFront URL `https://{distribution}.cloudfront.net/thumbnails/{videoId}.jpg` (BR-06).
+        creator:
+          $ref: '#/components/schemas/UserRef'
+        durationSeconds:
+          type: integer
+          minimum: 0
+          example: 312
+        viewCount:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Eventually consistent (BR-07).
+        publishedAt:
+          type: string
+          format: date-time
+          description: When the video first became `READY`.
+    VideoCardPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VideoCard'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+    VideoDetail:
+      type: object
+      description: |
+        Video detail (FR-PB-01). Media fields are `null` until the video is `READY`. `status`
+        and `failureReason` are returned only to the owner. Like and comment counts come from
+        `GET /videos/{videoId}/stats`.
+      required: [id, title, description, creator, thumbnailUrl, durationSeconds, renditions, viewCount, publishedAt, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/VideoId'
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/Description'
+        creator:
+          $ref: '#/components/schemas/UserRef'
+        thumbnailUrl:
+          type: [string, 'null']
+          format: uri
+        durationSeconds:
+          type: [integer, 'null']
+          minimum: 0
+        renditions:
+          type: array
+          description: Available renditions; empty until `READY`.
+          items:
+            $ref: '#/components/schemas/Rendition'
+        viewCount:
+          type: integer
+          format: int64
+          minimum: 0
+        publishedAt:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        status:
+          $ref: '#/components/schemas/VideoStatus'
+          description: Owner only.
+        failureReason:
+          type: [string, 'null']
+          description: Owner only. Human-readable reason when `status` is `FAILED` (FR-CR-02).
+    UpdateVideoRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/Description'
+    OwnVideo:
+      type: object
+      description: An item of the creator studio list (FR-CR-01).
+      required: [id, title, status, thumbnailUrl, durationSeconds, createdAt, publishedAt, viewCount, likeCount, commentCount]
+      properties:
+        id:
+          $ref: '#/components/schemas/VideoId'
+        title:
+          $ref: '#/components/schemas/Title'
+        status:
+          $ref: '#/components/schemas/VideoStatus'
+        failureReason:
+          type: [string, 'null']
+          description: Set when `status` is `FAILED` (FR-CR-02).
+        thumbnailUrl:
+          type: [string, 'null']
+          format: uri
+        durationSeconds:
+          type: [integer, 'null']
+          minimum: 0
+        createdAt:
+          type: string
+          format: date-time
+          description: Upload date.
+        publishedAt:
+          type: [string, 'null']
+          format: date-time
+        viewCount:
+          type: integer
+          format: int64
+          minimum: 0
+        likeCount:
+          type: integer
+          format: int64
+          minimum: 0
+        commentCount:
+          type: integer
+          format: int64
+          minimum: 0
+    OwnVideoPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OwnVideo'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+    PlaybackAccess:
+      type: object
+      required: [masterPlaylistUrl, expiresAt, cookies]
+      properties:
+        masterPlaylistUrl:
+          type: string
+          format: uri
+          description: '`https://{distribution}.cloudfront.net/videos/{videoId}/master.m3u8`'
+          example: https://d111111abcdef8.cloudfront.net/videos/8d0c5e2a-3b4f-4a8e-9c1d-2f6b7a8e9d01/master.m3u8
+        expiresAt:
+          type: string
+          format: date-time
+          description: Cookie expiry, 2 hours after issue (BR-LIM).
+        cookies:
+          type: object
+          description: |
+            The signed cookie values, for native players that send them as a `Cookie` header.
+            Web clients rely on `Set-Cookie` and can ignore this field.
+          required: [CloudFront-Policy, CloudFront-Signature, CloudFront-Key-Pair-Id]
+          additionalProperties: false
+          properties:
+            CloudFront-Policy:
+              type: string
+              description: Base64 (CloudFront URL-safe variant) custom policy.
+            CloudFront-Signature:
+              type: string
+              description: Signature of the policy with the private key, CloudFront URL-safe base64.
+            CloudFront-Key-Pair-Id:
+              type: string
+              description: Id of the public key in the distribution's trusted key group.
+              example: K2JCJMDEHXQW5F
+
+    # -------------------------------------------------------------------------
+    # Interactions
+    # -------------------------------------------------------------------------
+    VideoStats:
+      type: object
+      required: [videoId, viewCount, likeCount, commentCount]
+      properties:
+        videoId:
+          $ref: '#/components/schemas/VideoId'
+        viewCount:
+          type: integer
+          format: int64
+          minimum: 0
+        likeCount:
+          type: integer
+          format: int64
+          minimum: 0
+        commentCount:
+          type: integer
+          format: int64
+          minimum: 0
+        likedByMe:
+          type: boolean
+          description: Present only when the request carries a token.
+    Comment:
+      type: object
+      required: [id, videoId, author, body, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        videoId:
+          $ref: '#/components/schemas/VideoId'
+        author:
+          $ref: '#/components/schemas/UserRef'
+        body:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        createdAt:
+          type: string
+          format: date-time
+    CommentPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Comment'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+    CreateCommentRequest:
+      type: object
+      required: [body]
+      additionalProperties: false
+      properties:
+        body:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: 1-1,000 characters after trimming whitespace (BR-LIM).
+          example: ¡Excelente video!
+    LikeState:
+      type: object
+      required: [liked, likeCount]
+      properties:
+        liked:
+          type: boolean
+        likeCount:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Eventually consistent (BR-07).
+    ReportTargetType:
+      type: string
+      enum: [VIDEO, COMMENT]
+    ReportReason:
+      type: string
+      enum: [SPAM, HARASSMENT, SEXUAL_CONTENT, VIOLENCE, COPYRIGHT, OTHER]
+    ReportStatus:
+      type: string
+      enum: [OPEN, RESOLVED, DISMISSED]
+    CreateReportRequest:
+      type: object
+      required: [targetType, targetId, reason]
+      additionalProperties: false
+      properties:
+        targetType:
+          $ref: '#/components/schemas/ReportTargetType'
+        targetId:
+          type: string
+          format: uuid
+          description: Video id or comment id, according to `targetType`.
+        reason:
+          $ref: '#/components/schemas/ReportReason'
+        details:
+          type: string
+          minLength: 0
+          maxLength: 1000
+          description: Optional free text, 0-1,000 characters.
+    Report:
+      type: object
+      required: [id, reporterId, targetType, targetId, reason, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        reporterId:
+          type: string
+          format: uuid
+        targetType:
+          $ref: '#/components/schemas/ReportTargetType'
+        targetId:
+          type: string
+          format: uuid
+        reason:
+          $ref: '#/components/schemas/ReportReason'
+        details:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        createdAt:
+          type: string
+          format: date-time
+        resolvedAt:
+          type: [string, 'null']
+          format: date-time
+        resolvedBy:
+          type: [string, 'null']
+          format: uuid
+          description: Operator who resolved or dismissed the report.
+    ReportPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Report'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+    UpdateReportRequest:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [RESOLVED, DISMISSED]
