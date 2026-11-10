@@ -1,0 +1,63 @@
+@startuml c4-level3-upload
+' MyCilinder: C4 Level 3, Upload / Ingest API components
+' Guide for services/upload (Python, FastAPI). Component names suggest modules under app/;
+' shared pieces come from libs/python. Not final: adjust as the code takes shape.
+' Sources: Architecture §2.2 and §4.2, Interface Design §1.2 and §3.2, Data Design §1.1.
+
+!include <C4/C4_Component>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title MyCilinder: Upload / Ingest API components (C4 Level 3)
+
+Container(alb, "Internal ALB", "Application Load Balancer", "Routes /uploads and /uploads/*.")
+
+Container_Boundary(upload, "Upload / Ingest API (Python, FastAPI, ECS Fargate)") {
+    Component(middleware, "Middleware", "FastAPI, libs/python", "Origin-header check, correlation id, structlog and tracing, JWT validation, Problem Details errors.")
+    Component(health, "Health routes", "libs/python", "/healthz and /readyz.")
+
+    Component(router, "Uploads router", "app/api/uploads.py, Pydantic", "POST /uploads (requires Idempotency-Key), POST /uploads/{videoId}/urls, POST /uploads/{videoId}/complete. Request and response models.")
+
+    Component(upload_svc, "Upload service", "app/services/uploads.py", "Orchestrates: idempotency, limits, quota, video creation, URL issuing. Owner and PENDING_UPLOAD checks for the follow-up calls.")
+    Component(limits, "Limit validator", "app/services/limits.py", "BR-LIM on declared metadata: content type, size up to 1 GB, title and description length. Returns 422.")
+    Component(plan, "Upload planner", "app/services/plan.py", "Single PUT up to 100 MB; otherwise multipart with 64 MB parts. Sets the 15-min expiry.")
+
+    Component(idem_repo, "Idempotency repository", "app/repositories, psycopg 3", "upload.upload_requests: key, body hash, stored response. 409 on reuse with a different body.")
+    Component(quota_repo, "Quota repository", "app/repositories, psycopg 3", "upload.daily_quota: atomic check-and-increment per user and day. 429 when exceeded.")
+    Component(video_writer, "Video writer", "app/repositories, psycopg 3", "INSERT-only into catalog.videos with status PENDING_UPLOAD.")
+    Component(presigner, "S3 presigner", "app/storage, boto3", "Presigned PUT for raw/{videoId}/source with signed Content-Type and Content-Length; create multipart, presign parts, complete multipart.")
+    Component(config, "Config + secrets", "libs/python", "DB credentials from Secrets Manager at startup.")
+}
+
+ContainerDb(proxy, "RDS Proxy", "Amazon RDS Proxy", "Read/write endpoint.")
+ContainerDb(raw, "S3 raw-videos", "Amazon S3", "Client uploads land here directly.")
+Container_Ext(secrets, "Secrets Manager", "AWS Secrets Manager", "Service secrets.")
+
+Rel(alb, middleware, "HTTP requests", "HTTP")
+Rel(alb, health, "Health checks", "HTTP")
+Rel(middleware, router, "Authenticated requests")
+Rel(router, upload_svc, "Calls")
+
+Rel(upload_svc, idem_repo, "Look up / store result")
+Rel(upload_svc, limits, "Validates request")
+Rel(upload_svc, quota_repo, "Consumes quota")
+Rel(upload_svc, video_writer, "Creates video row")
+Rel(upload_svc, plan, "Chooses PUT or multipart")
+Rel(upload_svc, presigner, "Issues URLs, completes multipart")
+
+Rel(idem_repo, proxy, "SQL", "PostgreSQL, TLS")
+Rel(quota_repo, proxy, "SQL", "PostgreSQL, TLS")
+Rel(video_writer, proxy, "SQL", "PostgreSQL, TLS")
+Rel(presigner, raw, "CreateMultipartUpload, CompleteMultipartUpload; signs PutObject/UploadPart", "AWS SDK, SigV4")
+Rel(health, proxy, "Ping", "PostgreSQL, TLS")
+Rel(config, secrets, "Reads at startup", "HTTPS")
+
+note right of upload_svc
+  For POST /uploads, the idempotency record, the
+  quota increment, and the video row are written in
+  one transaction, so a retry with the same key never
+  double-counts quota.
+end note
+
+@enduml

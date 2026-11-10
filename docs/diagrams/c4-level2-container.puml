@@ -1,0 +1,102 @@
+@startuml c4-level2-container
+' MyCilinder: C4 Level 2, Container diagram
+' Source of truth: README §3.2, Design Description (architecture-and-components.md §1, §2, §4).
+' Shows the design-scale topology; the demo runs a throttled subset (1 task per service, 0-2 transcoders).
+' API calls to every service traverse CloudFront -> API Gateway -> VPC Link -> internal ALB.
+
+!include <C4/C4_Container>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title MyCilinder: Containers (C4 Level 2)
+
+Person(guest, "Guest", "Browses, searches, and watches.")
+Person(user, "Registered User / Creator", "Watches, comments, likes, reports, uploads.")
+Person(operator, "Platform Operator", "Moderates via /ops endpoints; monitors.")
+
+System_Ext(cognito, "Amazon Cognito", "User pool; issues JWTs; JWKS endpoint.")
+
+System_Boundary(mycilinder, "MyCilinder") {
+
+    Container(client, "Mobile app", "Flutter, Android (sideloaded APK)", "Browse, search, playback (HLS player), comments, likes, uploads. Composes Catalog and Interactions responses itself.")
+
+    Boundary(edge, "Edge (global)") {
+        Container(cdn, "CloudFront + WAF", "Amazon CloudFront, AWS WAF", "Single public entry point (*.cloudfront.net). /api/* to API Gateway; /videos/* and /thumbnails/* to hls-output via OAC. Signed cookies on video media; managed rules and per-IP rate limit.")
+    }
+
+    Boundary(region, "AWS us-east-1") {
+
+        Container(apigw, "API Gateway + VPC Link", "API Gateway HTTP API", "Validates Cognito JWTs, throttles, rejects requests without CloudFront's origin header; forwards to the VPC through the VPC Link.")
+
+        Boundary(vpc, "VPC (2 AZs)") {
+
+            Boundary(app_tier, "private-app subnets") {
+                Container(alb, "Internal ALB", "Application Load Balancer", "Routes by path prefix to the ECS services. Reachable only through the VPC Link.")
+
+                Container(auth, "Auth facade", "Go, ECS Fargate", "Register, confirm, login, refresh over Cognito; /me profile. Owns users.")
+                Container(catalog, "Catalog / Metadata API", "Go, ECS Fargate", "Feeds, search, video detail, creator pages, playback cookies, /ops/videos. Applies video status events. Owns videos.")
+                Container(interactions, "Interactions API", "Go, ECS Fargate", "Comments, likes, views, reports, /ops reports and comments. Counters in Redis, flushed to Aurora.")
+                Container(upload, "Upload / Ingest API", "Python, FastAPI, ECS Fargate", "Checks quotas, inserts the PENDING_UPLOAD video row, returns presigned PUT or multipart URLs.")
+                Container(transcoder, "Transcoder worker", "Python + ffmpeg, ECS Fargate Spot", "Consumes transcode jobs, verifies the source, writes 360p/720p HLS and a thumbnail, publishes status events. No database access.")
+            }
+
+            Boundary(data_tier, "private-data subnets") {
+                ContainerDb(proxy, "RDS Proxy", "Amazon RDS Proxy", "Bounded connection pool to Aurora. Read/write endpoint to the writer, read-only endpoint to the reader.")
+                ContainerDb(aurora, "Aurora PostgreSQL", "Aurora Serverless v2, writer + reader", "One schema per service: users, videos, comments, likes, video_stats, reports, upload_requests, daily_quota.")
+                ContainerDb(redis, "ElastiCache Redis", "Redis, primary + replica", "Hot feed and search cache, like/view counters, view dedup keys.")
+            }
+        }
+
+        Boundary(managed, "Regional managed services") {
+            ContainerDb(raw, "S3 raw-videos", "Amazon S3, versioned, private", "Original uploads at raw/{videoId}/source. Never deleted by the pipeline.")
+            ContainerDb(hls, "S3 hls-output", "Amazon S3, private", "HLS renditions, master.m3u8, thumbnails. Readable only through CloudFront OAC.")
+            ContainerQueue(tq, "SQS transcode-queue", "Amazon SQS + DLQ", "ObjectCreated jobs. 5 min visibility timeout, 3 receives, then DLQ.")
+            ContainerQueue(sns, "SNS video-events", "Amazon SNS", "video.processing, video.ready, video.failed.")
+            ContainerQueue(sq, "SQS video-status-queue", "Amazon SQS", "Subscribed to video-events; consumed by Catalog.")
+            Container(obs, "CloudWatch + X-Ray", "Amazon CloudWatch, AWS X-Ray, AWS Budgets", "Logs, metrics, alarms, traces, billing alarms. Every service emits telemetry (relations omitted).")
+        }
+    }
+}
+
+' People
+Rel(guest, client, "Uses")
+Rel(user, client, "Uses")
+Rel(operator, cdn, "Calls /api/v1/ops/* with scripts", "HTTPS")
+Rel(operator, obs, "Views dashboards, logs, and alarms", "AWS console")
+
+' Synchronous path
+Rel(client, cdn, "API calls and HLS playback", "HTTPS, signed cookies")
+Rel(client, raw, "Uploads the file directly with presigned URLs", "HTTPS PUT")
+Rel(cdn, apigw, "Forwards /api/*", "HTTPS + origin header")
+Rel(cdn, hls, "Reads on cache miss", "OAC")
+Rel(apigw, cognito, "Fetches JWKS to validate JWTs", "HTTPS")
+Rel(apigw, alb, "Forwards through VPC Link", "HTTP")
+Rel(alb, auth, "/auth/*, /me", "HTTP")
+Rel(alb, catalog, "/feed, /search, /videos/*, /creators/*, /me/videos, /ops/videos/*", "HTTP")
+Rel(alb, interactions, "/videos/*/comments|like|views|stats, /reports, /ops/reports*, /ops/comments/*", "HTTP")
+Rel(alb, upload, "/uploads", "HTTP")
+
+' Services to dependencies
+Rel(auth, cognito, "Sign-up, confirm, login, refresh", "HTTPS, AWS SDK")
+Rel(auth, proxy, "Reads and writes users", "PostgreSQL, TLS")
+Rel(auth, redis, "Login throttling counters", "RESP, TLS")
+Rel(catalog, proxy, "Reads and writes videos; reads users, video_stats views", "PostgreSQL, TLS")
+Rel(catalog, redis, "Cache-aside feeds and search", "RESP, TLS")
+Rel(catalog, hls, "Deletes outputs 7 days after video deletion", "AWS SDK")
+Rel(interactions, proxy, "Reads and writes comments, likes, video_stats, reports", "PostgreSQL, TLS")
+Rel(interactions, redis, "Counters, dirty set, view dedup", "RESP, TLS")
+Rel(upload, proxy, "Quotas; inserts PENDING_UPLOAD video", "PostgreSQL, TLS")
+Rel(upload, raw, "Presigns PUT / multipart URLs for", "AWS SDK (SigV4)")
+Rel(proxy, aurora, "Pooled connections", "PostgreSQL, TLS")
+
+' Asynchronous media pipeline
+Rel(raw, tq, "ObjectCreated event", "S3 event notification")
+Rel(transcoder, tq, "Long-polls jobs, extends visibility", "AWS SDK")
+Rel(transcoder, raw, "Reads source", "AWS SDK")
+Rel(transcoder, hls, "Writes renditions, thumbnail, master.m3u8 last", "AWS SDK")
+Rel(transcoder, sns, "Publishes status events", "AWS SDK")
+Rel(sns, sq, "Fans out to", "SNS subscription")
+Rel(catalog, sq, "Long-polls status events; sets READY / FAILED", "AWS SDK")
+
+@enduml

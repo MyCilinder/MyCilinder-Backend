@@ -1,0 +1,79 @@
+@startuml c4-level3-interactions
+' MyCilinder: C4 Level 3, Interactions API components
+' Guide for services/interactions (Go). Component names suggest packages under internal/;
+' shared pieces come from libs/go. Not final: adjust as the code takes shape.
+' Sources: Architecture §4.2, Interface Design §1.2, Data Design §1.1 and §3.2.
+
+!include <C4/C4_Component>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title MyCilinder: Interactions API components (C4 Level 3)
+
+Container(alb, "Internal ALB", "Application Load Balancer", "Routes /videos/*/stats|comments|like|views, /reports, /ops/reports*, /ops/comments/*.")
+
+Container_Boundary(interactions, "Interactions API (Go, ECS Fargate)") {
+    Component(router, "HTTP router + middleware", "chi, libs/go/middleware", "Origin-header check, correlation id, logging and tracing, JWT validation (required, optional, or operator group), per-user rate limit, Problem Details errors.")
+    Component(health, "Health handlers", "libs/go/health", "/healthz and /readyz.")
+
+    Component(engage_h, "Engagement handlers", "internal/http", "GET /stats; GET and POST /comments; PUT and DELETE /like; POST /views (X-Session-Id for guests).")
+    Component(mod_h, "Moderation handlers", "internal/http", "POST /reports; GET and PATCH /ops/reports; POST /ops/comments/{commentId}/hide.")
+
+    Component(video_guard, "Video guard", "internal/visibility", "Checks that the target video exists and is visible, using catalog.v_video_visibility.")
+    Component(comment_svc, "Comment service", "internal/comments", "Validates body (1-1,000 chars), creates comments, lists visible comments newest first.")
+    Component(like_svc, "Like service", "internal/likes", "Idempotent like/unlike on (video, user); changes the counter only if a row was inserted or deleted.")
+    Component(view_svc, "View service", "internal/views", "Deduplicates views per (video, viewer) for 30 min (BR-VIEW), then increments the counter.")
+    Component(stats_svc, "Stats service", "internal/stats", "View, like, comment counts and likedByMe. Redis first, video_stats as fallback.")
+    Component(report_svc, "Report service", "internal/reports", "Creates reports (409 on duplicate open report), operator queue, status changes, comment hiding.")
+
+    Component(counters, "Counter store", "internal/counters, go-redis", "Counters, dirty set of changed videos, view dedup keys (SET NX EX 1800).")
+    Component(jobs, "Background jobs", "internal/jobs", "Every 5 s: flush counter deltas into video_stats. Hourly: reconcile like and comment counts from source rows. Each run takes pg_try_advisory_xact_lock.")
+
+    Component(repo, "Interactions repository", "internal/store, pgx", "interactions.comments, likes, video_stats, reports.")
+    Component(audit_repo, "Audit writer", "internal/store, pgx", "INSERT-only into audit.audit_log (report resolution, comment hiding).")
+    Component(config, "Config + secrets", "libs/go/config", "DB credentials from Secrets Manager at startup.")
+}
+
+ContainerDb(proxy, "RDS Proxy", "Amazon RDS Proxy", "Read/write and read-only endpoints.")
+ContainerDb(redis, "ElastiCache Redis", "Redis", "Counters, dedup keys, rate-limit counters.")
+Container_Ext(secrets, "Secrets Manager", "AWS Secrets Manager", "Service secrets.")
+
+Rel(alb, router, "HTTP requests", "HTTP")
+Rel(alb, health, "Health checks", "HTTP")
+Rel(router, engage_h, "Public, optional, JWT routes")
+Rel(router, mod_h, "JWT and operator routes")
+Rel(router, redis, "Per-user rate limit", "RESP, TLS")
+
+Rel(engage_h, stats_svc, "Calls")
+Rel(engage_h, comment_svc, "Calls")
+Rel(engage_h, like_svc, "Calls")
+Rel(engage_h, view_svc, "Calls")
+Rel(mod_h, report_svc, "Calls")
+
+Rel(comment_svc, video_guard, "Target visible?")
+Rel(like_svc, video_guard, "Target visible?")
+Rel(view_svc, video_guard, "Target visible?")
+Rel(report_svc, video_guard, "Video target exists?")
+
+Rel(comment_svc, repo, "Reads and writes comments")
+Rel(comment_svc, counters, "Comment count +1")
+Rel(like_svc, repo, "Insert / delete like row")
+Rel(like_svc, counters, "Like count +/-1")
+Rel(view_svc, counters, "Dedup key, view count +1")
+Rel(stats_svc, counters, "Reads counts")
+Rel(stats_svc, repo, "Fallback and likedByMe")
+Rel(report_svc, repo, "Reports, hide comment")
+Rel(report_svc, audit_repo, "Records operator actions")
+
+Rel(jobs, counters, "Reads and clears dirty set")
+Rel(jobs, repo, "Upserts video_stats; recounts")
+
+Rel(video_guard, proxy, "Reads catalog.v_video_visibility", "PostgreSQL, TLS")
+Rel(repo, proxy, "SQL", "PostgreSQL, TLS")
+Rel(audit_repo, proxy, "SQL", "PostgreSQL, TLS")
+Rel(counters, redis, "Commands", "RESP, TLS")
+Rel(health, proxy, "Ping", "PostgreSQL, TLS")
+Rel(config, secrets, "Reads at startup", "HTTPS")
+
+@enduml

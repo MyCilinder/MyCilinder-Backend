@@ -1,0 +1,57 @@
+@startuml c4-level3-transcoder
+' MyCilinder: C4 Level 3, Transcoder worker components
+' Guide for services/transcoder (Python + ffmpeg). Component names suggest modules under worker/;
+' shared pieces come from libs/python. Not final: adjust as the code takes shape.
+' Sources: Architecture §2.2 and §4.2, Interface Design §2.1, FR-TR, FR-UP-07.
+
+!include <C4/C4_Component>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title MyCilinder: Transcoder worker components (C4 Level 3)
+
+ContainerQueue(tq, "SQS transcode-queue", "Amazon SQS + DLQ", "S3 ObjectCreated events. 5 min visibility, 3 receives.")
+
+Container_Boundary(transcoder, "Transcoder worker (Python + ffmpeg, ECS Fargate Spot)") {
+    Component(poller, "Queue poller", "worker/poller.py, boto3", "Long-polls one message at a time, ignores s3:TestEvent, derives videoId from raw/{videoId}/source, deletes the message on success.")
+    Component(heartbeat, "Visibility heartbeat", "worker/heartbeat.py", "Extends the message visibility every minute while a job runs.")
+    Component(shutdown, "Shutdown handler", "worker/shutdown.py", "On SIGTERM (Spot interruption) stops work and leaves the message untouched so it reappears.")
+
+    Component(job, "Job runner", "worker/job.py", "Runs one job: idempotency check, probe, encode, upload, publish. On a handled error at the last receive, publishes video.failed.")
+    Component(probe, "Media probe", "worker/probe.py, ffprobe", "Reads container, codec, duration, resolution of the real file and enforces BR-LIM (FR-UP-07).")
+    Component(ladder, "Rendition planner", "worker/ladder.py", "Chooses 360p and/or 720p without upscaling (FR-TR-02).")
+    Component(encoder, "Encoder", "worker/encode.py, ffmpeg subprocess", "Produces HLS variants, variant playlists, master.m3u8, and the thumbnail in scratch space.")
+    Component(storage, "Media storage", "worker/storage.py, boto3", "Downloads the source to ephemeral storage; uploads videos/{videoId}/ and thumbnails/{videoId}.jpg, master.m3u8 last; checks whether the master already exists.")
+    Component(publisher, "Event publisher", "worker/events.py, boto3", "Publishes the event envelope: video.processing, video.ready, video.failed.")
+    Component(config, "Config", "libs/python", "Environment variables: queue URL, bucket names, topic ARN, limits. No database credentials.")
+}
+
+ContainerDb(raw, "S3 raw-videos", "Amazon S3", "Source files. Read-only for the worker.")
+ContainerDb(hls, "S3 hls-output", "Amazon S3", "HLS outputs and thumbnails.")
+ContainerQueue(sns, "SNS video-events", "Amazon SNS", "Fans out to video-status-queue.")
+
+Rel(poller, tq, "ReceiveMessage, DeleteMessage", "AWS SDK")
+Rel(heartbeat, tq, "ChangeMessageVisibility", "AWS SDK")
+Rel(poller, job, "Hands off job")
+Rel(poller, heartbeat, "Starts / stops")
+Rel(shutdown, poller, "Stops polling")
+Rel(shutdown, job, "Cancels ffmpeg")
+
+Rel(job, storage, "Master exists? Download, upload")
+Rel(job, probe, "Validates source")
+Rel(job, ladder, "Plans renditions")
+Rel(job, encoder, "Encodes")
+Rel(job, publisher, "Status events")
+
+Rel(storage, raw, "GetObject", "AWS SDK")
+Rel(storage, hls, "PutObject, HeadObject", "AWS SDK")
+Rel(publisher, sns, "Publish", "AWS SDK")
+
+note bottom of job
+  Idempotency: if master.m3u8 already exists,
+  re-publish video.ready and delete the message.
+  The raw object is never modified or deleted.
+end note
+
+@enduml

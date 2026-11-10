@@ -264,7 +264,10 @@ MyCilinder-Backend/
     ├── testing-plan/
     │   └── software-test-plan.md
     ├── diagrams/
-    │   └── architecture.png
+    │   ├── architecture.png
+    │   ├── c4-level1-context.puml        # + rendered .png
+    │   ├── c4-level2-container.puml      # + rendered .png
+    │   └── c4-level3-*.puml              # one per service, + rendered .png
     └── openapi.yaml
 ```
 

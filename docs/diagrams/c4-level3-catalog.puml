@@ -1,0 +1,81 @@
+@startuml c4-level3-catalog
+' MyCilinder: C4 Level 3, Catalog / Metadata API components
+' Guide for services/catalog (Go). Component names suggest packages under internal/;
+' shared pieces come from libs/go. Not final: adjust as the code takes shape.
+' Sources: Architecture §2.3 and §4.2, Interface Design §1.2, §1.3, §2.1, Data Design §1.1 and §3.
+
+!include <C4/C4_Component>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title MyCilinder: Catalog / Metadata API components (C4 Level 3)
+
+Container(alb, "Internal ALB", "Application Load Balancer", "Routes /feed, /search, /creators/*, /videos/*, /me/videos, /ops/videos/*.")
+ContainerQueue(status_q, "SQS video-status-queue", "Amazon SQS", "video.processing, video.ready, video.failed.")
+
+Container_Boundary(catalog, "Catalog / Metadata API (Go, ECS Fargate)") {
+    Component(router, "HTTP router + middleware", "chi, libs/go/middleware", "Origin-header check, correlation id, logging and tracing, JWT validation (required, optional, or operator group), per-user rate limit, Problem Details errors.")
+    Component(health, "Health handlers", "libs/go/health", "/healthz and /readyz.")
+
+    Component(browse_h, "Browse handlers", "internal/http", "GET /feed, GET /search, GET /creators/{userId}/videos. Cursor pagination.")
+    Component(video_h, "Video handlers", "internal/http", "GET, PATCH, DELETE /videos/{videoId}; GET /me/videos; GET /videos/{videoId}/playback.")
+    Component(ops_h, "Operator handlers", "internal/http", "POST /ops/videos/{videoId}/hide and /restore.")
+
+    Component(browse_svc, "Browse service", "internal/browse", "Recent and most-viewed feeds, Spanish full-text search, creator pages. Cache-aside with single-flight; falls back to the reader when Redis is down.")
+    Component(video_svc, "Video service", "internal/video", "Visibility rules (404 for non-owners unless READY), ownership checks, edits, soft delete, hide and restore.")
+    Component(lifecycle, "Video lifecycle", "internal/lifecycle", "Forward-only state machine. The only code that changes videos.status; rejects backward or duplicate transitions.")
+    Component(playback_svc, "Playback service", "internal/playback", "Checks visibility, builds the master playlist URL and the cookie policy for /videos/{videoId}/* (2 h).")
+    Component(signer, "Cookie signer", "internal/cfsign", "Signs CloudFront custom policies with the RSA private key.")
+
+    Component(consumer, "Status event consumer", "internal/events, AWS SDK for Go v2", "Long-polls video-status-queue, parses the event envelope, applies it through the lifecycle, deletes the message.")
+    Component(jobs, "Background jobs", "internal/jobs", "Every 15 min: expire PENDING_UPLOAD after 24 h; mark PROCESSING after 2 h as FAILED. Daily: delete HLS outputs 7 days after deletion. Each run takes pg_try_advisory_xact_lock.")
+
+    Component(video_repo, "Video repository", "internal/store, pgx", "catalog.videos on the writer; feed and search queries on the reader. Reads auth.v_user_public and interactions.v_video_stats.")
+    Component(cache, "Feed cache", "internal/cache, go-redis", "Feed and search pages with TTLs; invalidation on status changes.")
+    Component(output_store, "Output cleaner", "internal/storage, AWS SDK for Go v2", "Lists and deletes videos/{videoId}/ and the thumbnail in hls-output.")
+    Component(audit_repo, "Audit writer", "internal/store, pgx", "INSERT-only into audit.audit_log (edit, delete, hide, restore).")
+    Component(config, "Config + secrets", "libs/go/config", "DB credentials and CloudFront private key from Secrets Manager at startup.")
+}
+
+ContainerDb(proxy, "RDS Proxy", "Amazon RDS Proxy", "Read/write and read-only endpoints.")
+ContainerDb(redis, "ElastiCache Redis", "Redis", "Feed cache, rate-limit counters.")
+ContainerDb(hls, "S3 hls-output", "Amazon S3", "HLS outputs and thumbnails.")
+Container_Ext(secrets, "Secrets Manager", "AWS Secrets Manager", "Service secrets.")
+
+Rel(alb, router, "HTTP requests", "HTTP")
+Rel(alb, health, "Health checks", "HTTP")
+Rel(router, browse_h, "Public routes")
+Rel(router, video_h, "Optional, JWT, or owner routes")
+Rel(router, ops_h, "Operator routes")
+Rel(router, redis, "Per-user rate limit", "RESP, TLS")
+
+Rel(browse_h, browse_svc, "Calls")
+Rel(video_h, video_svc, "Calls")
+Rel(video_h, playback_svc, "Calls")
+Rel(ops_h, video_svc, "Calls")
+
+Rel(browse_svc, cache, "Get / set pages")
+Rel(browse_svc, video_repo, "On cache miss")
+Rel(video_svc, video_repo, "Reads and edits")
+Rel(video_svc, lifecycle, "Delete, hide, restore")
+Rel(video_svc, audit_repo, "Records changes")
+Rel(playback_svc, video_svc, "Visibility check")
+Rel(playback_svc, signer, "Signs policy")
+
+Rel(consumer, status_q, "Receive, delete", "SQS long poll")
+Rel(consumer, lifecycle, "Applies event")
+Rel(jobs, lifecycle, "Expire, mark FAILED")
+Rel(jobs, output_store, "Cleanup of deleted videos")
+Rel(jobs, video_repo, "Batches + advisory lock")
+Rel(lifecycle, video_repo, "Conditional status update")
+Rel(lifecycle, cache, "Invalidates feeds")
+
+Rel(video_repo, proxy, "SQL", "PostgreSQL, TLS")
+Rel(audit_repo, proxy, "SQL", "PostgreSQL, TLS")
+Rel(cache, redis, "Commands", "RESP, TLS")
+Rel(output_store, hls, "ListBucket, DeleteObject", "AWS SDK")
+Rel(health, proxy, "Ping", "PostgreSQL, TLS")
+Rel(config, secrets, "Reads at startup", "HTTPS")
+
+@enduml

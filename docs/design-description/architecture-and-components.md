@@ -30,13 +30,37 @@ Related: [Overview](./overview.md) · [Data Design](./data-design.md) · [Interf
 
 *Figure 1: target architecture. The demo runs a throttled subset. Request routing is in §2.1.*
 
-> **C4 Level 1: System Context diagram goes here.**
-> Actors: Guest, Registered User / Creator, Platform Operator. External systems: Amazon Cognito, Cognito email, Vercel (optional web hosting).
+The C4 diagrams below are written in PlantUML with the C4-PlantUML library that ships with PlantUML. Each `.puml` file in `docs/diagrams/` is the source; the PNG next to it is rendered from it. After editing a source, render it again with `plantuml -tpng docs/diagrams/c4-*.puml`. The diagrams cover only the Android app; a web client is not in scope for now.
 
-> **C4 Level 2: Container diagram goes here.**
-> Containers: Flutter client, CloudFront + WAF, API Gateway, internal ALB, the five services, RDS Proxy, Aurora, Redis, S3 `raw-videos` and `hls-output`, SQS `transcode-queue` and `video-status-queue`, SNS `video-events`.
+**C4 Level 1: System Context** ([source](../diagrams/c4-level1-context.puml))
 
-> **C4 Level 3: Component diagrams go here** (one per service, using the components in §4.2).
+![C4 Level 1: System Context](../diagrams/c4-level1-context.png)
+
+*Figure 2: people and external systems around MyCilinder. Actors: Guest, Registered User / Creator, Platform Operator. External systems: Amazon Cognito and Cognito email.*
+
+**C4 Level 2: Containers** ([source](../diagrams/c4-level2-container.puml))
+
+![C4 Level 2: Containers](../diagrams/c4-level2-container.png)
+
+*Figure 3: the mobile app, edge, the five services, data stores, and messaging. The arrows to the ALB carry the routing rules in §2.1. CloudWatch and X-Ray receive telemetry from every service; those arrows are omitted.*
+
+**C4 Level 3: Components** (one per service)
+
+The component diagrams are a guide for the code structure, not a fixed design. Component names suggest packages (`internal/...` in Go, `app/...` or `worker/...` in Python), and shared middleware, health checks, and configuration come from `libs/` (§4.5). Adjust them as implementation progresses and keep the diagrams in sync. The detail behind each component is in §4.2.
+
+| Service | Diagram | Source |
+|---------|---------|--------|
+| Auth facade | [c4-level3-auth.png](../diagrams/c4-level3-auth.png) | [c4-level3-auth.puml](../diagrams/c4-level3-auth.puml) |
+| Catalog / Metadata | [c4-level3-catalog.png](../diagrams/c4-level3-catalog.png) | [c4-level3-catalog.puml](../diagrams/c4-level3-catalog.puml) |
+| Interactions | [c4-level3-interactions.png](../diagrams/c4-level3-interactions.png) | [c4-level3-interactions.puml](../diagrams/c4-level3-interactions.puml) |
+| Upload / Ingest | [c4-level3-upload.png](../diagrams/c4-level3-upload.png) | [c4-level3-upload.puml](../diagrams/c4-level3-upload.puml) |
+| Transcoder | [c4-level3-transcoder.png](../diagrams/c4-level3-transcoder.png) | [c4-level3-transcoder.puml](../diagrams/c4-level3-transcoder.puml) |
+
+The HTTP services share the same layering: router and middleware, then handlers, then services with the business rules, then repositories and AWS adapters. The design rules show up as components:
+- **Catalog:** a single *Video lifecycle* component is the only code that changes `videos.status` (§2.3).
+- **Interactions:** a *Video guard* reads `catalog.v_video_visibility` before any write.
+- **Upload / Ingest:** a *Video writer* holds the `INSERT`-only grant on `catalog.videos`.
+- **Transcoder:** no component talks to the database.
 
 ### 2.1 Request routing
 
