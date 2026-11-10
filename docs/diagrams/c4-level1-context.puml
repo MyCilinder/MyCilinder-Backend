@@ -1,0 +1,35 @@
+@startuml c4-level1-context
+' MyCilinder: C4 Level 1, System Context
+' Source of truth: README §3, Requirement Specification (overall-description.md §2),
+' Design Description (architecture-and-components.md §2).
+
+!include <C4/C4_Context>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title MyCilinder: System Context (C4 Level 1)
+
+Person(guest, "Guest", "Unauthenticated user of the mobile app, often arriving through a shared link. Browses, searches, watches, and reads comments and counts.")
+Person(user, "Registered User / Creator", "Verified account holder. Comments, likes, and reports. As a Creator, uploads, edits, and deletes own videos and follows their processing status.")
+Person(operator, "Platform Operator", "Development team member. Reviews reports, hides videos and comments through restricted /ops endpoints, and watches metrics and logs. No admin UI in the MVP.")
+
+System(mycilinder, "MyCilinder", "Video-on-demand platform: upload, asynchronous transcoding to HLS (360p/720p), browse and search, CDN playback, comments, likes, and view counts. Runs on AWS, us-east-1.")
+
+System_Ext(cognito, "Amazon Cognito", "Managed identity provider. User pool for registration, login, and token refresh; issues the JWTs that MyCilinder validates.")
+System_Ext(cognito_email, "Cognito email", "Cognito's built-in email delivery. Sends verification codes and password-reset messages.")
+
+' Layout hints: keep the three actors on the top row
+Lay_R(guest, user)
+Lay_R(user, operator)
+
+Rel(guest, mycilinder, "Browses, searches, and watches videos using the mobile app", "HTTPS, HLS")
+Rel(user, mycilinder, "Uploads videos, watches, comments, likes, reports using the mobile app", "HTTPS, HLS")
+Rel(operator, mycilinder, "Moderates content; monitors metrics, logs, and budget", "HTTPS /ops, AWS console")
+
+
+Rel(mycilinder, cognito, "Registers users, signs them in, refreshes tokens; validates JWTs against the JWKS", "HTTPS")
+Rel(cognito, cognito_email, "Requests verification and reset messages from")
+Rel_U(cognito_email, user, "Sends verification codes and password-reset links to", "Email")
+
+@enduml

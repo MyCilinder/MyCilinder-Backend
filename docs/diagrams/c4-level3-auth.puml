@@ -1,0 +1,59 @@
+@startuml c4-level3-auth
+' MyCilinder: C4 Level 3, Auth facade components
+' Guide for services/auth (Go). Component names suggest packages under internal/;
+' shared pieces come from libs/go. Not final: adjust as the code takes shape.
+' Sources: Architecture §4.2, Interface Design §1.2 and §3.1, Data Design §1.1.
+
+!include <C4/C4_Component>
+
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title MyCilinder: Auth facade components (C4 Level 3)
+
+Container(alb, "Internal ALB", "Application Load Balancer", "Routes /auth/* and /me.")
+
+Container_Boundary(auth, "Auth facade (Go, ECS Fargate)") {
+    Component(router, "HTTP router + middleware", "chi, libs/go/middleware", "Origin-header check, correlation id, logging and tracing, JWT validation on protected routes, login throttling, Problem Details errors.")
+    Component(health, "Health handlers", "libs/go/health", "/healthz and /readyz (database reachable).")
+
+    Component(auth_h, "Auth handlers", "internal/http", "register, confirm, resend-code, login, refresh, logout. Validates request bodies.")
+    Component(profile_h, "Profile handlers", "internal/http", "GET /me and PATCH /me.")
+
+    Component(auth_svc, "Auth service", "internal/auth", "Sign-up and login use cases. Creates the profile on first login. Maps Cognito errors to problem types and never reveals whether an email exists.")
+    Component(profile_svc, "Profile service", "internal/profile", "Reads the profile and email; validates and updates the display name.")
+
+    Component(cognito_client, "Cognito client", "internal/cognito, AWS SDK for Go v2", "SignUp, ConfirmSignUp, ResendConfirmationCode, InitiateAuth, RevokeToken, GetUser. Computes SECRET_HASH.")
+    Component(user_repo, "User repository", "internal/store, pgx", "auth.users: insert on first login (ON CONFLICT DO NOTHING), read, update display name.")
+    Component(audit_repo, "Audit writer", "internal/store, pgx", "INSERT-only into audit.audit_log (login, logout, profile changes).")
+    Component(config, "Config + secrets", "libs/go/config", "Environment variables; DB credentials and Cognito client secret from Secrets Manager at startup.")
+}
+
+ContainerDb(proxy, "RDS Proxy", "Amazon RDS Proxy", "Read/write endpoint to Aurora.")
+ContainerDb(redis, "ElastiCache Redis", "Redis", "Login throttling counters.")
+System_Ext(cognito, "Amazon Cognito", "User pool and confidential app client.")
+Container_Ext(secrets, "Secrets Manager", "AWS Secrets Manager", "Service secrets.")
+
+Rel(alb, router, "HTTP requests", "HTTP")
+Rel(alb, health, "Health checks", "HTTP")
+Rel(router, auth_h, "Public /auth/* routes; logout with JWT")
+Rel(router, profile_h, "/me with JWT")
+Rel(router, redis, "Login attempt counters", "RESP, TLS")
+
+Rel(auth_h, auth_svc, "Calls")
+Rel(profile_h, profile_svc, "Calls")
+
+Rel(auth_svc, cognito_client, "Uses")
+Rel(auth_svc, user_repo, "Creates profile on first login")
+Rel(auth_svc, audit_repo, "Records auth events")
+Rel(profile_svc, cognito_client, "GetUser for email")
+Rel(profile_svc, user_repo, "Reads and updates")
+Rel(profile_svc, audit_repo, "Records profile changes")
+
+Rel(cognito_client, cognito, "Identity operations", "HTTPS")
+Rel(user_repo, proxy, "SQL", "PostgreSQL, TLS")
+Rel(audit_repo, proxy, "SQL", "PostgreSQL, TLS")
+Rel(health, proxy, "Ping", "PostgreSQL, TLS")
+Rel(config, secrets, "Reads at startup", "HTTPS")
+
+@enduml
