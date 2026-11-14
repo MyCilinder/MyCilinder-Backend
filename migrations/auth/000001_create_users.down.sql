@@ -1,0 +1,3 @@
+DROP VIEW IF EXISTS auth.v_user_public;
+DROP TABLE IF EXISTS auth.users;
+DROP SCHEMA IF EXISTS auth;

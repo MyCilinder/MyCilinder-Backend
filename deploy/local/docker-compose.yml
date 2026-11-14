@@ -1,0 +1,65 @@
+# Local development stack (Architecture §4.5). Run from the repo root:
+#
+#   docker compose -f deploy/local/docker-compose.yml up -d
+#
+# Postgres stands in for Aurora behind RDS Proxy, Redis for ElastiCache. Credentials here
+# are local-only defaults.
+
+name: mycilinder
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mycilinder
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mycilinder"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot migration runners, one per schema. Each schema keeps its own version table,
+  # so services can migrate independently (MAINT-09).
+  migrate-audit:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ../../migrations/audit:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://postgres:postgres@postgres:5432/mycilinder?sslmode=disable&x-migrations-table=schema_migrations_audit
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  migrate-auth:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ../../migrations/auth:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://postgres:postgres@postgres:5432/mycilinder?sslmode=disable&x-migrations-table=schema_migrations_auth
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
