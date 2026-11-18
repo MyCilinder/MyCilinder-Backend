@@ -1,0 +1,8 @@
+# Build context is the repository root. Send only the code the service images need.
+*
+!libs/
+!services/
+**/.env
+**/.env.*
+!**/.env.example
+**/*_test.go
