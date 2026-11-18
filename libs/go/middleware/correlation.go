@@ -43,6 +43,12 @@ func Logger(ctx context.Context) *slog.Logger {
 	return slog.Default()
 }
 
+// WithLogger replaces the request-scoped logger, for example to add the user id after
+// authentication. Only opaque identifiers may be added (SEC-12).
+func WithLogger(ctx context.Context, l *slog.Logger) context.Context {
+	return context.WithValue(ctx, loggerKey{}, l)
+}
+
 func validCorrelationID(id string) bool {
 	if id == "" || len(id) > 128 {
 		return false

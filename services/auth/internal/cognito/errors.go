@@ -59,7 +59,7 @@ func mapError(err error) error {
 		target = ErrNotAuthorized
 	case "UserNotFoundException":
 		target = ErrUserNotFound
-	case "InvalidParameterException":
+	case "InvalidParameterException", "UnsupportedTokenTypeException":
 		target = ErrInvalidParameter
 	case "TooManyRequestsException", "LimitExceededException", "TooManyFailedAttemptsException", "CodeDeliveryFailureException":
 		target = ErrTooManyRequests

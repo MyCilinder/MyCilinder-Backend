@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	libconfig "github.com/MyCilinder/MyCilinder-Backend/libs/go/config"
 )
@@ -24,6 +25,22 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.Port != 8000 || cfg.LogLevel != slog.LevelInfo || cfg.RedisAddr != "127.0.0.1:6379" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
+	}
+	if cfg.LoginMaxFailuresPerEmail != 5 || cfg.LoginFailureWindow != 15*time.Minute || cfg.TrustedProxyHops != 0 {
+		t.Fatalf("unexpected throttle defaults: %+v", cfg)
+	}
+}
+
+func TestLoadInvalidLimits(t *testing.T) {
+	env := validEnv()
+	env["LOGIN_MAX_FAILURES_PER_EMAIL"] = "0"
+	env["PUBLIC_AUTH_WINDOW"] = "10ms"
+	env["TRUSTED_PROXY_HOPS"] = "-1"
+	_, err := Load(libconfig.FromMap(env))
+	for _, key := range []string{"LOGIN_MAX_FAILURES_PER_EMAIL", "PUBLIC_AUTH_WINDOW", "TRUSTED_PROXY_HOPS"} {
+		if err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("error does not mention %s: %v", key, err)
+		}
 	}
 }
 

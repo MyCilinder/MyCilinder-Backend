@@ -58,10 +58,11 @@ func run(args []string) error {
 		if len(args) < 3 {
 			return fmt.Errorf("signup needs <email> <displayName>")
 		}
-		if err := c.SignUp(ctx, email, password(), args[2]); err != nil {
+		sub, err := c.SignUp(ctx, email, password(), args[2])
+		if err != nil {
 			return err
 		}
-		fmt.Println("sign-up accepted; check the inbox for the code")
+		fmt.Printf("sign-up accepted (sub=%s); check the inbox for the code\n", sub)
 	case "confirm":
 		if len(args) < 3 {
 			return fmt.Errorf("confirm needs <email> <code>")

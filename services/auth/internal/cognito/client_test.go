@@ -37,7 +37,10 @@ type stubAPI struct {
 
 func (s *stubAPI) SignUp(_ context.Context, in *cip.SignUpInput, _ ...func(*cip.Options)) (*cip.SignUpOutput, error) {
 	s.last = in
-	return &cip.SignUpOutput{}, s.err
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &cip.SignUpOutput{UserSub: aws.String("new-sub")}, nil
 }
 func (s *stubAPI) ConfirmSignUp(_ context.Context, in *cip.ConfirmSignUpInput, _ ...func(*cip.Options)) (*cip.ConfirmSignUpOutput, error) {
 	s.last = in
@@ -99,7 +102,7 @@ func TestErrorMapping(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.code, func(t *testing.T) {
 			c := New(&stubAPI{err: apiErr(tt.code)}, testClientID, testSecret)
-			err := c.SignUp(context.Background(), "a@b.co", "pw", "A")
+			_, err := c.SignUp(context.Background(), "a@b.co", "pw", "A")
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("got %v, want %v", err, tt.want)
 			}
@@ -116,7 +119,7 @@ func TestErrorMapping(t *testing.T) {
 
 	t.Run("invalid password keeps the policy message", func(t *testing.T) {
 		c := New(&stubAPI{err: apiErr("InvalidPasswordException")}, testClientID, testSecret)
-		err := c.SignUp(context.Background(), "a@b.co", "pw", "A")
+		_, err := c.SignUp(context.Background(), "a@b.co", "pw", "A")
 		var pe *InvalidPasswordError
 		if !errors.As(err, &pe) || pe.Message != "InvalidPasswordException message" {
 			t.Fatalf("got %v", err)
@@ -127,8 +130,9 @@ func TestErrorMapping(t *testing.T) {
 func TestSignUpRequest(t *testing.T) {
 	stub := &stubAPI{}
 	c := New(stub, testClientID, testSecret)
-	if err := c.SignUp(context.Background(), "diego@example.com", "Secret#123", "Diego"); err != nil {
-		t.Fatal(err)
+	sub, err := c.SignUp(context.Background(), "diego@example.com", "Secret#123", "Diego")
+	if err != nil || sub != "new-sub" {
+		t.Fatalf("sub=%q err=%v", sub, err)
 	}
 	in := stub.last.(*cip.SignUpInput)
 	if aws.ToString(in.SecretHash) != SecretHash("diego@example.com", testClientID, testSecret) {

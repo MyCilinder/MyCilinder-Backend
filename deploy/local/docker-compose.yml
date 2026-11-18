@@ -61,5 +61,28 @@ services:
       postgres:
         condition: service_healthy
 
+  # Auth facade. Cognito settings come from services/auth/.env (copy .env.example);
+  # the database and Redis addresses below override the 127.0.0.1 values in that file so
+  # the container reaches the other Compose services.
+  auth:
+    build:
+      context: ../..
+      dockerfile: services/auth/Dockerfile
+    env_file:
+      - path: ../../services/auth/.env
+        required: false
+    environment:
+      DATABASE_URL: postgres://auth_svc:auth_svc_local@postgres:5432/mycilinder?sslmode=disable
+      REDIS_ADDR: redis:6379
+    ports:
+      - "${AUTH_PORT:-8000}:8000"
+    depends_on:
+      migrate-audit:
+        condition: service_completed_successfully
+      migrate-auth:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
 volumes:
   pgdata:

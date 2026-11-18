@@ -67,10 +67,11 @@ func (c *Client) hash(username string) *string {
 	return aws.String(SecretHash(username, c.clientID, c.clientSecret))
 }
 
-// SignUp registers email with password. The display name is stored in the standard
-// `name` attribute so it is available on first login (FR-AUTH-01, FR-AUTH-05).
-func (c *Client) SignUp(ctx context.Context, email, password, displayName string) error {
-	_, err := c.api.SignUp(ctx, &cip.SignUpInput{
+// SignUp registers email with password and returns the new user's sub. The display name
+// is stored in the standard `name` attribute so it is available on first login
+// (FR-AUTH-01, FR-AUTH-05).
+func (c *Client) SignUp(ctx context.Context, email, password, displayName string) (string, error) {
+	out, err := c.api.SignUp(ctx, &cip.SignUpInput{
 		ClientId:   aws.String(c.clientID),
 		SecretHash: c.hash(email),
 		Username:   aws.String(email),
@@ -80,7 +81,10 @@ func (c *Client) SignUp(ctx context.Context, email, password, displayName string
 			{Name: aws.String("name"), Value: aws.String(displayName)},
 		},
 	})
-	return mapError(err)
+	if err != nil {
+		return "", mapError(err)
+	}
+	return aws.ToString(out.UserSub), nil
 }
 
 // ConfirmSignUp confirms the account with the emailed code (FR-AUTH-02).

@@ -33,6 +33,19 @@ type Config struct {
 	CognitoUserPoolID   string
 	CognitoClientID     string
 	CognitoClientSecret string
+
+	// TrustedProxyHops is the number of proxies in front of the service that append to
+	// X-Forwarded-For (0 locally). See ratelimit.ClientIP.
+	TrustedProxyHops int
+
+	// Failed-login throttling (SEC-09).
+	LoginMaxFailuresPerEmail int
+	LoginMaxFailuresPerIP    int
+	LoginFailureWindow       time.Duration
+
+	// Request limit per client IP on the public /auth/* routes.
+	PublicAuthMaxPerIP int
+	PublicAuthWindow   time.Duration
 }
 
 // Load reads the configuration and returns every problem at once.
@@ -49,6 +62,13 @@ func Load(env *libconfig.Loader) (Config, error) {
 		CognitoUserPoolID:   env.Required("COGNITO_USER_POOL_ID"),
 		CognitoClientID:     env.Required("COGNITO_CLIENT_ID"),
 		CognitoClientSecret: env.Required("COGNITO_CLIENT_SECRET"),
+
+		TrustedProxyHops:         env.Int("TRUSTED_PROXY_HOPS", 0),
+		LoginMaxFailuresPerEmail: env.Int("LOGIN_MAX_FAILURES_PER_EMAIL", 5),
+		LoginMaxFailuresPerIP:    env.Int("LOGIN_MAX_FAILURES_PER_IP", 20),
+		LoginFailureWindow:       env.Duration("LOGIN_FAILURE_WINDOW", 15*time.Minute),
+		PublicAuthMaxPerIP:       env.Int("PUBLIC_AUTH_MAX_REQUESTS_PER_IP", 30),
+		PublicAuthWindow:         env.Duration("PUBLIC_AUTH_WINDOW", time.Minute),
 	}
 	if cfg.OriginVerifyEnabled {
 		cfg.OriginVerifySecret = env.Required("ORIGIN_VERIFY_SECRET")
@@ -61,6 +81,26 @@ func Load(env *libconfig.Loader) (Config, error) {
 	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		errs = append(errs, fmt.Errorf("PORT: must be between 1 and 65535, got %d", cfg.Port))
+	}
+	if cfg.TrustedProxyHops < 0 {
+		errs = append(errs, fmt.Errorf("TRUSTED_PROXY_HOPS: must be 0 or more, got %d", cfg.TrustedProxyHops))
+	}
+	for name, n := range map[string]int{
+		"LOGIN_MAX_FAILURES_PER_EMAIL":    cfg.LoginMaxFailuresPerEmail,
+		"LOGIN_MAX_FAILURES_PER_IP":       cfg.LoginMaxFailuresPerIP,
+		"PUBLIC_AUTH_MAX_REQUESTS_PER_IP": cfg.PublicAuthMaxPerIP,
+	} {
+		if n < 1 {
+			errs = append(errs, fmt.Errorf("%s: must be at least 1, got %d", name, n))
+		}
+	}
+	for name, d := range map[string]time.Duration{
+		"LOGIN_FAILURE_WINDOW": cfg.LoginFailureWindow,
+		"PUBLIC_AUTH_WINDOW":   cfg.PublicAuthWindow,
+	} {
+		if d < time.Second {
+			errs = append(errs, fmt.Errorf("%s: must be at least 1s, got %s", name, d))
+		}
 	}
 	return cfg, errors.Join(append([]error{env.Err()}, errs...)...)
 }
