@@ -184,7 +184,15 @@ services:
   gateway:
     image: nginx:1.27-alpine
     volumes:
-      - ./gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Rendered by the nginx image at startup into conf.d/default.conf, filling in the
+      # *_UPSTREAM values below (only those; other $variables are left for nginx).
+      - ./gateway/nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      NGINX_ENVSUBST_FILTER: _UPSTREAM$$
+      CATALOG_UPSTREAM: http://catalog:8001
+      INTERACTIONS_UPSTREAM: http://interactions:8000
+      UPLOAD_UPSTREAM: http://upload:8000
+      MOCK_UPSTREAM: http://mock-api:8000
     ports:
       - "${GATEWAY_PORT:-8000}:80"
     healthcheck:

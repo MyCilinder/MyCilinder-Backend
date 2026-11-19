@@ -2,6 +2,7 @@
 *
 !libs/
 !services/
+!deploy/local/mock-api/
 **/.env
 **/.env.*
 !**/.env.example

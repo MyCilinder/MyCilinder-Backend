@@ -1,0 +1,37 @@
+# Mock mode for frontend demos (development only). Adds the in-memory mock API and
+# points the gateway's Catalog, Interactions and Upload routes at it. Auth stays real.
+# Run from the repo root:
+#
+#   docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.mock.yml up -d --build
+#
+# Leave out the second -f to go back to the real services. See mock-api/README.md.
+
+services:
+  mock-api:
+    build:
+      context: ../..
+      dockerfile: deploy/local/mock-api/Dockerfile
+    # Same Cognito user pool and app client as the auth facade, so its tokens verify here.
+    env_file:
+      - path: ../../services/auth/.env
+        required: true
+    environment:
+      PORT: "8000"
+      AUTH_URL: http://auth:8000
+      # Uploaded videos go PROCESSING -> READY (playing a stock clip) after this long.
+      # "0s" keeps them in PROCESSING.
+      PROCESSING_DELAY: ${MOCK_PROCESSING_DELAY:-15s}
+      # Give each signed-in user starter videos in every studio state.
+      SEED_PER_USER: ${MOCK_SEED_PER_USER:-true}
+    # Direct access for debugging. Clients use the gateway on :8000.
+    ports:
+      - "${MOCK_API_PORT:-8090}:8000"
+
+  gateway:
+    environment:
+      CATALOG_UPSTREAM: http://mock-api:8000
+      INTERACTIONS_UPSTREAM: http://mock-api:8000
+      UPLOAD_UPSTREAM: http://mock-api:8000
+    depends_on:
+      mock-api:
+        condition: service_started
