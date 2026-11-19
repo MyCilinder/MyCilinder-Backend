@@ -157,9 +157,11 @@ services:
       HOME: /home/nonroot
     volumes:
       - ${HOME}/.aws:/home/nonroot/.aws:ro
-      # CloudFront signing key for playback. Uncomment and set
-      # CLOUDFRONT_PRIVATE_KEY_FILE=/run/secrets/cloudfront.pem in .env.
-      # - ${CLOUDFRONT_PRIVATE_KEY_PATH}:/run/secrets/cloudfront.pem:ro
+      # CloudFront signing key for playback: services/catalog/secrets/cloudfront.pem,
+      # used when CLOUDFRONT_PRIVATE_KEY_FILE=/run/secrets/catalog/cloudfront.pem.
+      # The directory is in the repo (key files are gitignored), so the mount works
+      # before any key exists.
+      - ../../services/catalog/secrets:/run/secrets/catalog:ro
     # Direct access for debugging. Clients use the gateway on :8000.
     ports:
       - "${CATALOG_PORT:-8001}:8001"

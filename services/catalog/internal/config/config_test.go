@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 
 	libconfig "github.com/MyCilinder/MyCilinder-Backend/libs/go/config"
 )
@@ -29,6 +30,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.OperatorsGroup != "operators" {
 		t.Errorf("OperatorsGroup = %q", cfg.OperatorsGroup)
 	}
+	if cfg.JobInterval != 15*time.Minute || cfg.PendingUploadExpiry != 24*time.Hour ||
+		cfg.ProcessingTimeout != 2*time.Hour || cfg.CleanupInterval != 24*time.Hour ||
+		cfg.OutputRetention != 7*24*time.Hour {
+		t.Errorf("job defaults = %s %s %s %s %s", cfg.JobInterval, cfg.PendingUploadExpiry,
+			cfg.ProcessingTimeout, cfg.CleanupInterval, cfg.OutputRetention)
+	}
 	if cfg.ConsumerEnabled || cfg.JobsEnabled || cfg.PlaybackConfigured() {
 		t.Errorf("background workers and playback should be off by default: %+v", cfg)
 	}
@@ -46,6 +53,8 @@ func TestLoadErrors(t *testing.T) {
 		{"origin verify needs secret", with(base(), "ORIGIN_VERIFY_ENABLED", "true"), []string{"ORIGIN_VERIFY_SECRET"}},
 		{"consumer needs queue", with(base(), "CONSUMER_ENABLED", "true"), []string{"VIDEO_STATUS_QUEUE_URL"}},
 		{"jobs need bucket", with(base(), "JOBS_ENABLED", "true"), []string{"HLS_OUTPUT_BUCKET"}},
+		{"bad duration", with(base(), "JOB_INTERVAL", "often"), []string{"JOB_INTERVAL"}},
+		{"duration too short", with(base(), "OUTPUT_RETENTION", "0s"), []string{"OUTPUT_RETENTION"}},
 		{"partial cloudfront", with(base(), "CLOUDFRONT_DOMAIN", "d123.cloudfront.net"), []string{"set all three or none"}},
 	}
 	for _, tt := range tests {
@@ -70,6 +79,19 @@ func TestLoadReaderURL(t *testing.T) {
 	}
 	if cfg.DatabaseReaderURL != "postgres://reader" {
 		t.Errorf("DatabaseReaderURL = %q", cfg.DatabaseReaderURL)
+	}
+}
+
+func TestLoadDemoJobSettings(t *testing.T) {
+	env := base()
+	env["JOB_INTERVAL"] = "10s"
+	env["OUTPUT_RETENTION"] = "1m"
+	cfg, err := Load(libconfig.FromMap(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.JobInterval != 10*time.Second || cfg.OutputRetention != time.Minute {
+		t.Errorf("JobInterval = %s, OutputRetention = %s", cfg.JobInterval, cfg.OutputRetention)
 	}
 }
 

@@ -6,3 +6,5 @@
 **/.env.*
 !**/.env.example
 **/*_test.go
+services/*/secrets/
+**/*.pem

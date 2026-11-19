@@ -56,6 +56,16 @@ type Config struct {
 	// cleanup). Every task may run them; an advisory lock keeps one run at a time.
 	JobsEnabled     bool
 	HLSOutputBucket string
+	// JobInterval is how often the expiry and stuck-processing jobs run (15 min).
+	// PendingUploadExpiry and ProcessingTimeout are their age thresholds (BR-LIM: 24 h;
+	// Architecture §2.3: 2 h). CleanupInterval is how often the HLS output cleanup runs
+	// (daily), and OutputRetention is how long outputs of a DELETED video are kept
+	// (Data Design §2.3: 7 days). Short values make the jobs easy to demo locally.
+	JobInterval         time.Duration
+	PendingUploadExpiry time.Duration
+	ProcessingTimeout   time.Duration
+	CleanupInterval     time.Duration
+	OutputRetention     time.Duration
 
 	// Signed playback cookies (Interface Design §3.3). Locally the private key is a PEM
 	// file mounted into the container; on ECS it comes from Secrets Manager.
@@ -82,6 +92,12 @@ func Load(env *libconfig.Loader) (Config, error) {
 		ConsumerEnabled:     env.Bool("CONSUMER_ENABLED", false),
 		JobsEnabled:         env.Bool("JOBS_ENABLED", false),
 
+		JobInterval:         env.Duration("JOB_INTERVAL", 15*time.Minute),
+		PendingUploadExpiry: env.Duration("PENDING_UPLOAD_EXPIRY", 24*time.Hour),
+		ProcessingTimeout:   env.Duration("PROCESSING_TIMEOUT", 2*time.Hour),
+		CleanupInterval:     env.Duration("CLEANUP_INTERVAL", 24*time.Hour),
+		OutputRetention:     env.Duration("OUTPUT_RETENTION", 7*24*time.Hour),
+
 		CloudFrontDomain:         env.String("CLOUDFRONT_DOMAIN", ""),
 		CloudFrontKeyPairID:      env.String("CLOUDFRONT_KEY_PAIR_ID", ""),
 		CloudFrontPrivateKeyFile: env.String("CLOUDFRONT_PRIVATE_KEY_FILE", ""),
@@ -104,6 +120,17 @@ func Load(env *libconfig.Loader) (Config, error) {
 	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		errs = append(errs, fmt.Errorf("PORT: must be between 1 and 65535, got %d", cfg.Port))
+	}
+	for name, d := range map[string]time.Duration{
+		"JOB_INTERVAL":          cfg.JobInterval,
+		"PENDING_UPLOAD_EXPIRY": cfg.PendingUploadExpiry,
+		"PROCESSING_TIMEOUT":    cfg.ProcessingTimeout,
+		"CLEANUP_INTERVAL":      cfg.CleanupInterval,
+		"OUTPUT_RETENTION":      cfg.OutputRetention,
+	} {
+		if d < time.Second {
+			errs = append(errs, fmt.Errorf("%s: must be at least 1s, got %s", name, d))
+		}
 	}
 	// CloudFront signing is all or nothing: a partial setup would fail on the first
 	// playback request instead of at startup.
