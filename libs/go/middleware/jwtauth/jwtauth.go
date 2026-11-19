@@ -159,7 +159,7 @@ func (v *CognitoVerifier) Verify(ctx context.Context, raw string) (Claims, error
 
 type claimsKey struct{}
 
-// FromContext returns the claims set by Require.
+// FromContext returns the claims set by Require or Optional.
 func FromContext(ctx context.Context) (Claims, bool) {
 	c, ok := ctx.Value(claimsKey{}).(Claims)
 	return c, ok
@@ -176,29 +176,76 @@ func WithClaims(ctx context.Context, c Claims) context.Context {
 func Require(v Verifier) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			raw, ok := bearerToken(r)
+			if _, ok := bearerToken(r); !ok {
+				w.Header().Set("WWW-Authenticate", `Bearer`)
+				problem.Write(w, r, http.StatusUnauthorized, problem.Unauthenticated, "missing bearer token")
+				return
+			}
+			authenticate(v, w, r, next)
+		})
+	}
+}
+
+// Optional lets requests without an Authorization header through as guests (no claims
+// in the context). A request that does send the header must carry a valid bearer token:
+// an invalid or expired one gets 401, as on Require routes, so a client with a stale
+// token is told to refresh instead of silently seeing the guest view.
+func Optional(v Verifier) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			authenticate(v, w, r, next)
+		})
+	}
+}
+
+// RequireGroup returns 403 unless the verified user belongs to group (cognito:groups),
+// for example "operators". It must run after Require; without claims it returns 401.
+func RequireGroup(group string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims, ok := FromContext(r.Context())
 			if !ok {
 				w.Header().Set("WWW-Authenticate", `Bearer`)
 				problem.Write(w, r, http.StatusUnauthorized, problem.Unauthenticated, "missing bearer token")
 				return
 			}
-			claims, err := v.Verify(r.Context(), raw)
-			if errors.Is(err, ErrKeysUnavailable) {
-				middleware.Logger(r.Context()).Error("JWT signing keys unavailable", "err", err)
-				problem.Write(w, r, http.StatusServiceUnavailable, problem.Unavailable, "")
+			if !claims.InGroup(group) {
+				problem.Write(w, r, http.StatusForbidden, problem.Forbidden, "")
 				return
 			}
-			if err != nil {
-				middleware.Logger(r.Context()).Debug("token rejected", "err", err)
-				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-				problem.Write(w, r, http.StatusUnauthorized, problem.Unauthenticated, "invalid or expired token")
-				return
-			}
-			ctx := WithClaims(r.Context(), claims)
-			ctx = middleware.WithLogger(ctx, middleware.Logger(ctx).With("userId", claims.Subject))
-			next.ServeHTTP(w, r.WithContext(ctx))
+			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// authenticate verifies the bearer token and calls next with the claims in the context,
+// or writes 401 (bad token) or 503 (signing keys unavailable).
+func authenticate(v Verifier, w http.ResponseWriter, r *http.Request, next http.Handler) {
+	raw, ok := bearerToken(r)
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		problem.Write(w, r, http.StatusUnauthorized, problem.Unauthenticated, "invalid or expired token")
+		return
+	}
+	claims, err := v.Verify(r.Context(), raw)
+	if errors.Is(err, ErrKeysUnavailable) {
+		middleware.Logger(r.Context()).Error("JWT signing keys unavailable", "err", err)
+		problem.Write(w, r, http.StatusServiceUnavailable, problem.Unavailable, "")
+		return
+	}
+	if err != nil {
+		middleware.Logger(r.Context()).Debug("token rejected", "err", err)
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		problem.Write(w, r, http.StatusUnauthorized, problem.Unauthenticated, "invalid or expired token")
+		return
+	}
+	ctx := WithClaims(r.Context(), claims)
+	ctx = middleware.WithLogger(ctx, middleware.Logger(ctx).With("userId", claims.Subject))
+	next.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func bearerToken(r *http.Request) (string, bool) {

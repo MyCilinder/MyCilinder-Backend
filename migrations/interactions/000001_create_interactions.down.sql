@@ -1,0 +1,9 @@
+DROP VIEW IF EXISTS interactions.v_video_stats;
+DROP TABLE IF EXISTS interactions.reports;
+DROP TABLE IF EXISTS interactions.video_stats;
+DROP TABLE IF EXISTS interactions.likes;
+DROP TABLE IF EXISTS interactions.comments;
+DROP TYPE IF EXISTS interactions.report_status;
+DROP TYPE IF EXISTS interactions.report_reason;
+DROP TYPE IF EXISTS interactions.report_target;
+DROP SCHEMA IF EXISTS interactions;
