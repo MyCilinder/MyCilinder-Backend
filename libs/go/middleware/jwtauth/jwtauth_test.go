@@ -131,3 +131,88 @@ func TestRequire(t *testing.T) {
 		})
 	}
 }
+
+func TestOptional(t *testing.T) {
+	iss := jwtauthtest.New(t, clientID)
+	v := newVerifier(t, iss)
+	var seen jwtauth.Claims
+	var hadClaims bool
+	h := jwtauth.Optional(v)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen, hadClaims = jwtauth.FromContext(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	valid := iss.Token(t, "user-1", jwtauthtest.Options{})
+	expired := iss.Token(t, "user-1", jwtauthtest.Options{TTL: -time.Hour})
+	tests := []struct {
+		name       string
+		header     string
+		want       int
+		wantClaims bool
+	}{
+		{"no header is a guest", "", http.StatusNoContent, false},
+		{"valid token", "Bearer " + valid, http.StatusNoContent, true},
+		{"invalid token", "Bearer x.y.z", http.StatusUnauthorized, false},
+		{"expired token", "Bearer " + expired, http.StatusUnauthorized, false},
+		{"wrong scheme", "Basic abc", http.StatusUnauthorized, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seen, hadClaims = jwtauth.Claims{}, false
+			req := httptest.NewRequest(http.MethodGet, "/videos/x", nil)
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+			}
+			if hadClaims != tt.wantClaims {
+				t.Errorf("claims in context = %v, want %v", hadClaims, tt.wantClaims)
+			}
+			if tt.wantClaims && seen.Subject != "user-1" {
+				t.Errorf("subject = %q", seen.Subject)
+			}
+		})
+	}
+}
+
+func TestRequireGroup(t *testing.T) {
+	iss := jwtauthtest.New(t, clientID)
+	v := newVerifier(t, iss)
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	chained := jwtauth.Require(v)(jwtauth.RequireGroup("operators")(ok))
+
+	tests := []struct {
+		name   string
+		header string
+		want   int
+	}{
+		{"no token", "", http.StatusUnauthorized},
+		{"no groups", "Bearer " + iss.Token(t, "u", jwtauthtest.Options{}), http.StatusForbidden},
+		{"other group", "Bearer " + iss.Token(t, "u", jwtauthtest.Options{Groups: []string{"creators"}}), http.StatusForbidden},
+		{"operator", "Bearer " + iss.Token(t, "u", jwtauthtest.Options{Groups: []string{"creators", "operators"}}), http.StatusNoContent},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/ops/videos/x/hide", nil)
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			rec := httptest.NewRecorder()
+			chained.ServeHTTP(rec, req)
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tt.want, rec.Body.String())
+			}
+		})
+	}
+
+	t.Run("without Require in front", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		jwtauth.RequireGroup("operators")(ok).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", rec.Code)
+		}
+	})
+}

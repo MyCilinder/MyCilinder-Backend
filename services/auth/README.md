@@ -78,13 +78,15 @@ From the repository root. Go is not required on the host; every command below ha
 Docker form.
 
 ```sh
-# Postgres, Redis, migrations, and the auth service in a container (port 8000)
+# Postgres, Redis, migrations, and the services in containers. Clients use the local
+# gateway on port 8000; the auth container is also published directly on port 8010.
 docker compose -f deploy/local/docker-compose.yml up -d --build
 
-# or: only the dependencies, then run the service from source
+# or: only the dependencies, then run the service from source. Port 8000 belongs to the
+# gateway, so use 8010 and set B=http://127.0.0.1:8010/api/v1 below.
 docker compose -f deploy/local/docker-compose.yml up -d postgres redis migrate-audit migrate-auth
 set -a; . services/auth/.env; set +a
-go run ./services/auth/cmd/auth
+PORT=8010 go run ./services/auth/cmd/auth
 ```
 
 Stop with `docker compose -f deploy/local/docker-compose.yml down` (add `-v` to delete the

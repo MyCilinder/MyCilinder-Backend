@@ -18,7 +18,6 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d mycilinder"]
       interval: 2s
@@ -35,6 +34,21 @@ services:
       timeout: 3s
       retries: 30
 
+  # Creates or updates the per-service login roles. Idempotent and runs on every `up`,
+  # before any migration, so roles added later reach existing volumes without a wipe.
+  # Every role exists before any migration runs, which lets the schema that owns a view
+  # grant it to its readers (no cross-schema migration ordering).
+  bootstrap-roles:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ./bootstrap:/bootstrap:ro
+    command: ["psql", "-v", "ON_ERROR_STOP=1", "-h", "postgres", "-U", "postgres", "-d", "mycilinder", "-f", "/bootstrap/roles.sql"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # One-shot migration runners, one per schema. Each schema keeps its own version table,
   # so services can migrate independently (MAINT-09).
   migrate-audit:
@@ -46,8 +60,8 @@ services:
       - -database=postgres://postgres:postgres@postgres:5432/mycilinder?sslmode=disable&x-migrations-table=schema_migrations_audit
       - up
     depends_on:
-      postgres:
-        condition: service_healthy
+      bootstrap-roles:
+        condition: service_completed_successfully
 
   migrate-auth:
     image: migrate/migrate:v4.18.3
@@ -58,8 +72,72 @@ services:
       - -database=postgres://postgres:postgres@postgres:5432/mycilinder?sslmode=disable&x-migrations-table=schema_migrations_auth
       - up
     depends_on:
-      postgres:
-        condition: service_healthy
+      bootstrap-roles:
+        condition: service_completed_successfully
+
+  migrate-catalog:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ../../migrations/catalog:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://postgres:postgres@postgres:5432/mycilinder?sslmode=disable&x-migrations-table=schema_migrations_catalog
+      - up
+    depends_on:
+      bootstrap-roles:
+        condition: service_completed_successfully
+
+  migrate-interactions:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ../../migrations/interactions:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://postgres:postgres@postgres:5432/mycilinder?sslmode=disable&x-migrations-table=schema_migrations_interactions
+      - up
+    depends_on:
+      bootstrap-roles:
+        condition: service_completed_successfully
+
+  migrate-upload:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ../../migrations/upload:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://postgres:postgres@postgres:5432/mycilinder?sslmode=disable&x-migrations-table=schema_migrations_upload
+      - up
+    depends_on:
+      bootstrap-roles:
+        condition: service_completed_successfully
+
+  # Local mock data (seed/seed.sql), after every migration. Idempotent; reset.sql starts
+  # over. SEED_OWNER_SUB (your Cognito test user's sub) is read from
+  # services/catalog/.env; if it is unset, the owner's videos go to a placeholder user.
+  seed:
+    image: postgres:16-alpine
+    env_file:
+      - path: ../../services/catalog/.env
+        required: false
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ./seed:/seed:ro
+    command:
+      - sh
+      - -c
+      - psql -v ON_ERROR_STOP=1 -h postgres -U postgres -d mycilinder -v seed_owner_sub="$${SEED_OWNER_SUB:-}" -f /seed/seed.sql
+    depends_on:
+      migrate-audit:
+        condition: service_completed_successfully
+      migrate-auth:
+        condition: service_completed_successfully
+      migrate-catalog:
+        condition: service_completed_successfully
+      migrate-interactions:
+        condition: service_completed_successfully
+      migrate-upload:
+        condition: service_completed_successfully
 
   # Auth facade. Cognito settings come from services/auth/.env (copy .env.example);
   # the database and Redis addresses below override the 127.0.0.1 values in that file so
@@ -74,8 +152,9 @@ services:
     environment:
       DATABASE_URL: postgres://auth_svc:auth_svc_local@postgres:5432/mycilinder?sslmode=disable
       REDIS_ADDR: redis:6379
+    # Direct access for debugging. Clients use the gateway on :8000.
     ports:
-      - "${AUTH_PORT:-8000}:8000"
+      - "${AUTH_PORT:-8010}:8000"
     depends_on:
       migrate-audit:
         condition: service_completed_successfully
@@ -83,6 +162,74 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+
+  # Catalog service. Settings come from services/catalog/.env (copy .env.example); the
+  # database and Redis addresses below override the 127.0.0.1 values in that file so the
+  # container reaches the other Compose services. On ECS the same image gets RDS Proxy
+  # and ElastiCache endpoints and uses the task role instead of a profile.
+  catalog:
+    build:
+      context: ../..
+      dockerfile: services/catalog/Dockerfile
+    env_file:
+      - path: ../../services/catalog/.env
+        required: false
+    # Run as your host user so the container can read the mounted ~/.aws files, which
+    # are usually mode 600. Export LOCAL_UID/LOCAL_GID if yours are not 1000.
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    environment:
+      DATABASE_URL: postgres://catalog_svc:catalog_svc_local@postgres:5432/mycilinder?sslmode=disable
+      DATABASE_READER_URL: postgres://catalog_svc:catalog_svc_local@postgres:5432/mycilinder?sslmode=disable
+      REDIS_ADDR: redis:6379
+      # AWS dev stack through your local profile (AWS_PROFILE in .env). ~/.aws is mounted
+      # at /aws rather than under the image's home: /home/nonroot is mode 700 and owned by
+      # the image's nonroot user, so the host UID set above could not enter it.
+      AWS_CONFIG_FILE: /aws/config
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+    volumes:
+      - ${HOME}/.aws:/aws:ro
+      # CloudFront signing key for playback: services/catalog/secrets/cloudfront.pem,
+      # used when CLOUDFRONT_PRIVATE_KEY_FILE=/run/secrets/catalog/cloudfront.pem.
+      # The directory is in the repo (key files are gitignored), so the mount works
+      # before any key exists.
+      - ../../services/catalog/secrets:/run/secrets/catalog:ro
+    # Direct access for debugging. Clients use the gateway on :8000.
+    ports:
+      - "${CATALOG_PORT:-8001}:8001"
+    depends_on:
+      migrate-catalog:
+        condition: service_completed_successfully
+      # Grants on auth.v_user_public, interactions.v_video_stats, and audit.audit_log.
+      migrate-auth:
+        condition: service_completed_successfully
+      migrate-interactions:
+        condition: service_completed_successfully
+      migrate-audit:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # Local API gateway: the single entry point for clients in development,
+  # http://localhost:8000/api/v1 (Android emulator: http://10.0.2.2:8000/api/v1).
+  # Routes by path like the ALB and adds dev-only CORS. See gateway/nginx.conf.
+  gateway:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${GATEWAY_PORT:-8000}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Started together with the services, but not gated on their health: a service
+    # that is down returns a 503 problem through the gateway.
+    depends_on:
+      auth:
+        condition: service_started
+      catalog:
+        condition: service_started
 
 volumes:
   pgdata:

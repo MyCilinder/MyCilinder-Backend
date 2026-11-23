@@ -14,3 +14,8 @@ coverage.*
 .vscode/
 *.swp
 .DS_Store
+
+# Local service secrets (for example the CloudFront signing key)
+services/*/secrets/*
+!services/*/secrets/README.md
+*.pem
