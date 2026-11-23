@@ -37,35 +37,35 @@ func do(t *testing.T, h http.Handler, method, path, token string) int {
 }
 
 func TestRouteAuth(t *testing.T) {
-	h := NewRouter(Options{Verifier: fakeVerifier{}})
+	h := NewRouter(testOptions())
 	const id = "33333333-3333-3333-3333-333333333333"
 	tests := []struct {
 		method, path, token string
 		want                int
 	}{
-		// Public.
-		{"GET", "/api/v1/feed", "", 501},
-		{"GET", "/api/v1/search?q=campus", "", 501},
-		{"GET", "/api/v1/creators/" + id + "/videos", "", 501},
-		// Optional: guest and valid token pass, an invalid token is rejected.
-		{"GET", "/api/v1/videos/" + id, "", 501},
-		{"GET", "/api/v1/videos/" + id, "user", 501},
+		// Public. The fakes return empty pages.
+		{"GET", "/api/v1/feed", "", 200},
+		{"GET", "/api/v1/search?q=campus", "", 200},
+		{"GET", "/api/v1/creators/" + id + "/videos", "", 200},
+		// Optional: guest and valid token pass, an invalid token is rejected. The fake
+		// video service knows no videos.
+		{"GET", "/api/v1/videos/" + id, "", 404},
+		{"GET", "/api/v1/videos/" + id, "user", 404},
 		{"GET", "/api/v1/videos/" + id, "bad", 401},
 		{"GET", "/api/v1/videos/" + id + "/playback", "", 501},
 		{"GET", "/api/v1/videos/" + id + "/playback", "bad", 401},
 		// JWT.
 		{"GET", "/api/v1/me/videos", "", 401},
-		{"GET", "/api/v1/me/videos", "user", 501},
+		{"GET", "/api/v1/me/videos", "user", 200},
 		{"PATCH", "/api/v1/videos/" + id, "", 401},
-		{"PATCH", "/api/v1/videos/" + id, "user", 501},
 		{"DELETE", "/api/v1/videos/" + id, "", 401},
-		{"DELETE", "/api/v1/videos/" + id, "user", 501},
+		{"DELETE", "/api/v1/videos/" + id, "user", 204},
 		// Operator.
 		{"POST", "/api/v1/ops/videos/" + id + "/hide", "", 401},
 		{"POST", "/api/v1/ops/videos/" + id + "/hide", "user", 403},
-		{"POST", "/api/v1/ops/videos/" + id + "/hide", "operator", 501},
+		{"POST", "/api/v1/ops/videos/" + id + "/hide", "operator", 204},
 		{"POST", "/api/v1/ops/videos/" + id + "/restore", "user", 403},
-		{"POST", "/api/v1/ops/videos/" + id + "/restore", "operator", 501},
+		{"POST", "/api/v1/ops/videos/" + id + "/restore", "operator", 204},
 		// Unknown route.
 		{"GET", "/api/v1/nope", "", 404},
 	}
@@ -81,12 +81,11 @@ func TestRouteAuth(t *testing.T) {
 
 func TestHealthAndOrigin(t *testing.T) {
 	failing := health.Check{Name: "database", Fn: func(context.Context) error { return errors.New("down") }}
-	h := NewRouter(Options{
-		Verifier:            fakeVerifier{},
-		OriginVerifyEnabled: true,
-		OriginVerifySecret:  "s3cret",
-		ReadinessChecks:     []health.Check{failing},
-	})
+	opts := testOptions()
+	opts.OriginVerifyEnabled = true
+	opts.OriginVerifySecret = "s3cret"
+	opts.ReadinessChecks = []health.Check{failing}
+	h := NewRouter(opts)
 	if got := do(t, h, "GET", "/healthz", ""); got != 200 {
 		t.Errorf("/healthz = %d, want 200", got)
 	}

@@ -14,7 +14,7 @@ import (
 	"github.com/MyCilinder/MyCilinder-Backend/libs/go/problem"
 )
 
-// Options configures the router. Verifier is required.
+// Options configures the router. Verifier and every service are required.
 type Options struct {
 	OriginVerifyEnabled bool
 	OriginVerifySecret  string
@@ -23,6 +23,14 @@ type Options struct {
 	Verifier jwtauth.Verifier
 	// OperatorsGroup is the cognito:groups value required on /ops routes.
 	OperatorsGroup string
+
+	Videos     VideoService
+	Browse     BrowseService
+	Studio     StudioService
+	Moderation ModerationService
+	// MediaDomain is the CloudFront domain used for thumbnail URLs. Empty means the URLs
+	// are relative (/thumbnails/{id}.jpg).
+	MediaDomain string
 }
 
 // NewRouter returns the service handler.
@@ -33,7 +41,13 @@ func NewRouter(opts Options) http.Handler {
 	if opts.OperatorsGroup == "" {
 		opts.OperatorsGroup = "operators"
 	}
-	h := &handlers{}
+	h := &handlers{
+		videos:     opts.Videos,
+		browse:     opts.Browse,
+		studio:     opts.Studio,
+		moderation: opts.Moderation,
+		media:      mediaURLs{domain: opts.MediaDomain},
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.Correlation)

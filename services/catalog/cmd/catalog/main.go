@@ -18,8 +18,15 @@ import (
 	"github.com/MyCilinder/MyCilinder-Backend/libs/go/health"
 	"github.com/MyCilinder/MyCilinder-Backend/libs/go/middleware/jwtauth"
 	"github.com/MyCilinder/MyCilinder-Backend/libs/go/redisclient"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/browse"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/cache"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/config"
 	httpapi "github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/http"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/lifecycle"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/moderation"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/store"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/studio"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/video"
 )
 
 func main() {
@@ -102,10 +109,22 @@ func run() error {
 	}
 	defer func() { _ = verifier.Close(context.Background()) }()
 
-	// TODO: build the repositories on writer and reader, the cache on rdb, and the
-	// services, then pass them to the router. Start the status consumer and the jobs
-	// here when cfg.ConsumerEnabled and cfg.JobsEnabled are set.
-	_ = reader
+	// Repositories and services. Reads go to the reader and fall back to the writer.
+	// Feeds, search, and READY video detail are cached in Redis (cache-aside); every
+	// status change or edit drops the video:{id} entry after commit.
+	videoRepo := store.NewVideos(writer, reader)
+	redisCache := cache.New(cache.NewRedisStore(rdb), slog.Default())
+	cachedVideos := cache.NewVideos(redisCache, videoRepo)
+	machine := lifecycle.NewMachine(writer, cachedVideos)
+
+	videos := video.NewService(cachedVideos)
+	browseSvc := browse.NewService(videoRepo, cache.NewPages(redisCache))
+	studioSvc := studio.NewService(writer, videoRepo, machine)
+	moderationSvc := moderation.NewService(machine, store.NewAudit("catalog"))
+
+	// TODO: build the playback signer when cfg.PlaybackConfigured(). Start the status
+	// consumer and the jobs here when cfg.ConsumerEnabled and cfg.JobsEnabled are set;
+	// both use machine.
 	slog.Info("starting",
 		"consumerEnabled", cfg.ConsumerEnabled,
 		"jobsEnabled", cfg.JobsEnabled,
@@ -119,6 +138,11 @@ func run() error {
 		ReadinessChecks:     checks,
 		Verifier:            verifier,
 		OperatorsGroup:      cfg.OperatorsGroup,
+		Videos:              videos,
+		Browse:              browseSvc,
+		Studio:              studioSvc,
+		Moderation:          moderationSvc,
+		MediaDomain:         cfg.CloudFrontDomain,
 	})
 
 	srv := &http.Server{
