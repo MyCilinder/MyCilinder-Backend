@@ -13,6 +13,8 @@ import (
 	"github.com/MyCilinder/MyCilinder-Backend/libs/go/middleware/jwtauth"
 	"github.com/MyCilinder/MyCilinder-Backend/libs/go/problem"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/browse"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/cfsign"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/playback"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/video"
 )
 
@@ -41,10 +43,15 @@ type ModerationService interface {
 	Restore(ctx context.Context, operatorID, id string) error
 }
 
-// handlers holds the route handlers. Add the playback service as a field here and pass
-// it in through Options.
+// PlaybackService is implemented by *playback.Service.
+type PlaybackService interface {
+	Grant(ctx context.Context, id, viewerID string) (cfsign.Grant, error)
+}
+
+// handlers holds the route handlers.
 type handlers struct {
 	videos     VideoService
+	playback   PlaybackService
 	browse     BrowseService
 	studio     StudioService
 	moderation ModerationService
@@ -119,8 +126,39 @@ func (h *handlers) writeDetail(w http.ResponseWriter, d video.Detail) {
 	writeJSON(w, http.StatusOK, h.toVideoDetail(d))
 }
 
-// GET /videos/{videoId}/playback (optional token)
-func (h *handlers) getPlayback(w http.ResponseWriter, r *http.Request) { notImplemented(w, r) }
+// playbackAccess is the PlaybackAccess body.
+type playbackAccess struct {
+	MasterPlaylistURL string            `json:"masterPlaylistUrl"`
+	ExpiresAt         string            `json:"expiresAt"`
+	Cookies           map[string]string `json:"cookies"`
+}
+
+// GET /videos/{videoId}/playback (optional token). Three Set-Cookie lines for web
+// clients, and the same values in the body for native players (Interface Design §1.3).
+func (h *handlers) getPlayback(w http.ResponseWriter, r *http.Request) {
+	claims, _ := jwtauth.FromContext(r.Context())
+	g, err := h.playback.Grant(r.Context(), chi.URLParam(r, "videoId"), claims.Subject)
+	if errors.Is(err, playback.ErrNotConfigured) {
+		middleware.Logger(r.Context()).Error("playback requested but CLOUDFRONT_* is not set")
+		problem.Write(w, r, http.StatusServiceUnavailable, problem.Unavailable, "")
+		return
+	}
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	body := playbackAccess{
+		MasterPlaylistURL: g.MasterPlaylistURL,
+		ExpiresAt:         formatTime(g.ExpiresAt),
+		Cookies:           make(map[string]string, len(g.Cookies)),
+	}
+	for _, c := range g.Cookies {
+		http.SetCookie(w, c)
+		body.Cookies[c.Name] = c.Value
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, body)
+}
 
 // --- studio ---
 
@@ -194,10 +232,6 @@ func (h *handlers) writeNoContent(w http.ResponseWriter, r *http.Request, err er
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func notImplemented(w http.ResponseWriter, r *http.Request) {
-	problem.Write(w, r, http.StatusNotImplemented, problem.NotImplemented, "")
 }
 
 // --- response bodies (openapi.yaml components.schemas) ---

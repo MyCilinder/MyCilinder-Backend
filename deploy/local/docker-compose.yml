@@ -111,6 +111,34 @@ services:
       bootstrap-roles:
         condition: service_completed_successfully
 
+  # Local mock data (seed/seed.sql), after every migration. Idempotent; reset.sql starts
+  # over. SEED_OWNER_SUB (your Cognito test user's sub) is read from
+  # services/catalog/.env; if it is unset, the owner's videos go to a placeholder user.
+  seed:
+    image: postgres:16-alpine
+    env_file:
+      - path: ../../services/catalog/.env
+        required: false
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ./seed:/seed:ro
+    command:
+      - sh
+      - -c
+      - psql -v ON_ERROR_STOP=1 -h postgres -U postgres -d mycilinder -v seed_owner_sub="$${SEED_OWNER_SUB:-}" -f /seed/seed.sql
+    depends_on:
+      migrate-audit:
+        condition: service_completed_successfully
+      migrate-auth:
+        condition: service_completed_successfully
+      migrate-catalog:
+        condition: service_completed_successfully
+      migrate-interactions:
+        condition: service_completed_successfully
+      migrate-upload:
+        condition: service_completed_successfully
+
   # Auth facade. Cognito settings come from services/auth/.env (copy .env.example);
   # the database and Redis addresses below override the 127.0.0.1 values in that file so
   # the container reaches the other Compose services.
@@ -153,10 +181,13 @@ services:
       DATABASE_URL: postgres://catalog_svc:catalog_svc_local@postgres:5432/mycilinder?sslmode=disable
       DATABASE_READER_URL: postgres://catalog_svc:catalog_svc_local@postgres:5432/mycilinder?sslmode=disable
       REDIS_ADDR: redis:6379
-      # AWS dev stack through your local profile (AWS_PROFILE in .env).
-      HOME: /home/nonroot
+      # AWS dev stack through your local profile (AWS_PROFILE in .env). ~/.aws is mounted
+      # at /aws rather than under the image's home: /home/nonroot is mode 700 and owned by
+      # the image's nonroot user, so the host UID set above could not enter it.
+      AWS_CONFIG_FILE: /aws/config
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
     volumes:
-      - ${HOME}/.aws:/home/nonroot/.aws:ro
+      - ${HOME}/.aws:/aws:ro
       # CloudFront signing key for playback: services/catalog/secrets/cloudfront.pem,
       # used when CLOUDFRONT_PRIVATE_KEY_FILE=/run/secrets/catalog/cloudfront.pem.
       # The directory is in the repo (key files are gitignored), so the mount works

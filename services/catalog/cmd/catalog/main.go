@@ -10,8 +10,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
 	libconfig "github.com/MyCilinder/MyCilinder-Backend/libs/go/config"
 	"github.com/MyCilinder/MyCilinder-Backend/libs/go/db"
@@ -20,10 +26,15 @@ import (
 	"github.com/MyCilinder/MyCilinder-Backend/libs/go/redisclient"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/browse"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/cache"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/cfsign"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/config"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/events"
 	httpapi "github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/http"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/jobs"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/lifecycle"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/moderation"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/playback"
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/storage"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/store"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/studio"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/video"
@@ -122,9 +133,47 @@ func run() error {
 	studioSvc := studio.NewService(writer, videoRepo, machine)
 	moderationSvc := moderation.NewService(machine, store.NewAudit("catalog"))
 
-	// TODO: build the playback signer when cfg.PlaybackConfigured(). Start the status
-	// consumer and the jobs here when cfg.ConsumerEnabled and cfg.JobsEnabled are set;
-	// both use machine.
+	// Background work: the status consumer and the jobs. They stop with ctx (SIGTERM),
+	// and shutdown waits for them after the HTTP server has drained.
+	var background sync.WaitGroup
+	defer background.Wait()
+
+	// AWS clients (SQS, S3) use the default credential chain: AWS_PROFILE locally, the
+	// task role on ECS. Loaded only when something needs them.
+	var awsCfg *awsLoaded
+	if cfg.ConsumerEnabled || cfg.JobsEnabled {
+		awsCfg, err = loadAWS(ctx, cfg.AWSRegion)
+		if err != nil {
+			return err
+		}
+	}
+	if cfg.ConsumerEnabled {
+		consumer := events.NewConsumer(sqs.NewFromConfig(awsCfg.cfg), cfg.VideoStatusQueueURL, machine, slog.Default())
+		background.Add(1)
+		go func() { defer background.Done(); consumer.Run(ctx) }()
+	}
+
+	if cfg.JobsEnabled {
+		runner := jobs.NewRunner(writer, slog.Default(),
+			jobs.Expiry(cfg.JobInterval, cfg.PendingUploadExpiry, machine),
+			jobs.Sweep(cfg.JobInterval, cfg.ProcessingTimeout, machine),
+			jobs.Cleanup(cfg.CleanupInterval, cfg.OutputRetention,
+				storage.NewCleaner(s3.NewFromConfig(awsCfg.cfg), cfg.HLSOutputBucket), slog.Default()),
+		)
+		background.Add(1)
+		go func() { defer background.Done(); runner.Run(ctx) }()
+	}
+
+	// Signed playback cookies. Without CLOUDFRONT_* the endpoint returns 503.
+	var signer playback.Signer
+	if cfg.PlaybackConfigured() {
+		key, err := cfsign.LoadKey(cfg.CloudFrontPrivateKeyFile)
+		if err != nil {
+			return err
+		}
+		signer = cfsign.New(cfg.CloudFrontDomain, cfg.CloudFrontKeyPairID, key)
+	}
+	playbackSvc := playback.NewService(cachedVideos, signer)
 	slog.Info("starting",
 		"consumerEnabled", cfg.ConsumerEnabled,
 		"jobsEnabled", cfg.JobsEnabled,
@@ -139,6 +188,7 @@ func run() error {
 		Verifier:            verifier,
 		OperatorsGroup:      cfg.OperatorsGroup,
 		Videos:              videos,
+		Playback:            playbackSvc,
 		Browse:              browseSvc,
 		Studio:              studioSvc,
 		Moderation:          moderationSvc,
@@ -177,4 +227,16 @@ func run() error {
 	}
 	slog.Info("stopped")
 	return nil
+}
+
+type awsLoaded struct{ cfg aws.Config }
+
+func loadAWS(ctx context.Context, region string) (*awsLoaded, error) {
+	lctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	c, err := awsconfig.LoadDefaultConfig(lctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("aws config: %w", err)
+	}
+	return &awsLoaded{cfg: c}, nil
 }

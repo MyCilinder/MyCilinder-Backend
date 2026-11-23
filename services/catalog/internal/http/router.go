@@ -25,6 +25,7 @@ type Options struct {
 	OperatorsGroup string
 
 	Videos     VideoService
+	Playback   PlaybackService
 	Browse     BrowseService
 	Studio     StudioService
 	Moderation ModerationService
@@ -43,6 +44,7 @@ func NewRouter(opts Options) http.Handler {
 	}
 	h := &handlers{
 		videos:     opts.Videos,
+		playback:   opts.Playback,
 		browse:     opts.Browse,
 		studio:     opts.Studio,
 		moderation: opts.Moderation,

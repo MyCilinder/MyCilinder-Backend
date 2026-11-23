@@ -52,7 +52,7 @@ func TestRouteAuth(t *testing.T) {
 		{"GET", "/api/v1/videos/" + id, "", 404},
 		{"GET", "/api/v1/videos/" + id, "user", 404},
 		{"GET", "/api/v1/videos/" + id, "bad", 401},
-		{"GET", "/api/v1/videos/" + id + "/playback", "", 501},
+		{"GET", "/api/v1/videos/" + id + "/playback", "", 404},
 		{"GET", "/api/v1/videos/" + id + "/playback", "bad", 401},
 		// JWT.
 		{"GET", "/api/v1/me/videos", "", 401},

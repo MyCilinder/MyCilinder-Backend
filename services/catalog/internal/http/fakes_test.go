@@ -3,6 +3,8 @@ package httpapi
 import (
 	"context"
 
+	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/cfsign"
+
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/browse"
 	"github.com/MyCilinder/MyCilinder-Backend/services/catalog/internal/video"
 )
@@ -79,8 +81,21 @@ func testOptions() Options {
 	return Options{
 		Verifier:   fakeVerifier{},
 		Videos:     &fakeVideos{},
+		Playback:   &fakePlayback{err: video.ErrNotFound},
 		Browse:     &fakeBrowse{},
 		Studio:     &fakeStudio{},
 		Moderation: &fakeModeration{},
 	}
+}
+
+// fakePlayback returns a fixed grant or error.
+type fakePlayback struct {
+	grant  cfsign.Grant
+	err    error
+	viewer string
+}
+
+func (f *fakePlayback) Grant(_ context.Context, _, viewer string) (cfsign.Grant, error) {
+	f.viewer = viewer
+	return f.grant, f.err
 }
